@@ -1,0 +1,120 @@
+name: GemmaInfer CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------
+  # Job 1: CUDA Kernel Compilation Verification
+  # Validates that all .cu and C++ kernels compile with nvcc
+  # targeting RTX 3090 (sm_86) and RTX 4090 (sm_89) architectures.
+  # -------------------------------------------------------------
+  cuda-compilation-check:
+    name: CUDA nvcc Compilation (sm_86 & sm_89)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install PyTorch with CUDA Support
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install torch --index-url https://download.pytorch.org/whl/cu121
+          pip install -e .
+
+      - name: Install CUDA Toolkit (nvcc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nvidia-cuda-toolkit
+
+      - name: Verify nvcc and Driver Tooling
+        run: |
+          nvcc --version
+
+      - name: Compile C++/CUDA Kernels (FORCE_CUDA=1)
+        env:
+          FORCE_CUDA: "1"
+          TORCH_CUDA_ARCH_LIST: "8.6;8.9"
+        run: |
+          python setup.py build_ext --inplace
+
+      - name: Check Compiled Shared Library
+        run: |
+          ls -la gemmainfer_csrc*.so
+
+  # -------------------------------------------------------------
+  # Job 2: Model Architecture & Runtime Test Suite
+  # Validates Gemma 4 26B A4B dimensions, MoE routing,
+  # heterogeneous attention, and speculative verification.
+  # -------------------------------------------------------------
+  unit-test-suite:
+    name: Test Suite (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .
+
+      - name: Build Extension (CPU/C++ Fallback)
+        run: |
+          python setup.py build_ext --inplace
+
+      - name: Run Full Test Suite
+        env:
+          PYTHONPATH: "."
+        run: |
+          python tests/test_gemmainfer.py
+
+  # -------------------------------------------------------------
+  # Job 3: Compute-Sanitizer (Runs on GPU-enabled Runner)
+  # Executes memcheck and racecheck on real GPU runners.
+  # -------------------------------------------------------------
+  gpu-compute-sanitizer:
+    name: GPU Compute-Sanitizer (Memory & Race Check)
+    # Runs automatically on self-hosted or GitHub GPU runners
+    runs-on: [self-hosted, linux, gpu]
+    needs: [cuda-compilation-check, unit-test-suite]
+    if: false # Enable when self-hosted GPU runner is registered
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build CUDA Extension In-Place
+        run: |
+          python setup.py build_ext --inplace
+
+      - name: Run Memory Sanitizer (memcheck)
+        run: |
+          compute-sanitizer --tool memcheck python tests/test_cuda_kernels_sanitizer.py
+
+      - name: Run Race Condition Sanitizer (racecheck)
+        run: |
+          compute-sanitizer --tool racecheck python tests/test_cuda_kernels_sanitizer.py
