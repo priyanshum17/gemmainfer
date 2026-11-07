@@ -46,7 +46,7 @@ jobs:
       - name: Install Dependencies with uv and Ninja
         run: |
           uv pip install --system ninja
-          uv pip install --system torch --index-url https://download.pytorch.org/whl/cu121
+          uv pip install --system "torch==2.5.1" --extra-index-url https://download.pytorch.org/whl/cu121
           uv pip install --system --no-build-isolation -e .
 
       - name: Compile C++/CUDA Kernels (FORCE_CUDA=1)
@@ -89,7 +89,7 @@ jobs:
       - name: Install Dependencies with uv
         run: |
           uv pip install --system ninja
-          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system "torch==2.5.1" --extra-index-url https://download.pytorch.org/whl/cpu
           uv pip install --system --no-build-isolation -e .
 
       - name: Build Extension (CPU/C++ Fallback)
@@ -124,7 +124,7 @@ jobs:
       - name: Install Dependencies with uv
         run: |
           uv pip install --system ninja
-          uv pip install --system torch --index-url https://download.pytorch.org/whl/cu121
+          uv pip install --system "torch==2.5.1" --extra-index-url https://download.pytorch.org/whl/cu121
           uv pip install --system --no-build-isolation -e .
 
       - name: Build CUDA Extension In-Place

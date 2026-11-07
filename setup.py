@@ -20,7 +20,7 @@ if HAS_TORCH:
     has_cuda = torch.cuda.is_available() or os.environ.get("FORCE_CUDA", "0") == "1"
 
     sources = ["csrc/pybind.cpp"]
-    extra_compile_args = {"cxx": ["-O3", "-std=c++17"]}
+    extra_compile_args = {"cxx": ["-O3", "-std=c++20"]}
 
     if sys.platform == "darwin":
         os.environ["ARCHFLAGS"] = "-arch arm64"
