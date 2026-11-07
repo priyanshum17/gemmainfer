@@ -13,7 +13,7 @@ concurrency:
 jobs:
   # -------------------------------------------------------------
   # Job 1: CUDA Kernel Compilation Verification
-  # Validates that all .cu and C++ kernels compile with nvcc
+  # Validates that all .cu and C++ kernels compile with nvcc & ninja
   # targeting RTX 3090 (sm_86) and RTX 4090 (sm_89) architectures.
   # -------------------------------------------------------------
   cuda-compilation-check:
@@ -23,26 +23,31 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Set up CUDA 12.1 Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.1.1'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install PyTorch with CUDA Support
-        run: |
-          pip install --upgrade pip setuptools wheel
-          pip install torch --index-url https://download.pytorch.org/whl/cu121
-          pip install -e .
-
-      - name: Install CUDA Toolkit (nvcc)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y nvidia-cuda-toolkit
-
-      - name: Verify nvcc and Driver Tooling
+      - name: Verify nvcc and CUDA Tooling
         run: |
           nvcc --version
+          echo "CUDA_PATH: $CUDA_PATH"
+
+      - name: Install Dependencies with uv and Ninja
+        run: |
+          uv pip install --system ninja
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cu121
+          uv pip install --system --no-build-isolation -e .
 
       - name: Compile C++/CUDA Kernels (FORCE_CUDA=1)
         env:
@@ -71,17 +76,21 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: "pip"
 
-      - name: Install Dependencies
+      - name: Install Dependencies with uv
         run: |
-          pip install --upgrade pip setuptools wheel
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e .
+          uv pip install --system ninja
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system --no-build-isolation -e .
 
       - name: Build Extension (CPU/C++ Fallback)
         run: |
@@ -106,6 +115,17 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Dependencies with uv
+        run: |
+          uv pip install --system ninja
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cu121
+          uv pip install --system --no-build-isolation -e .
 
       - name: Build CUDA Extension In-Place
         run: |
