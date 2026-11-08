@@ -10,6 +10,7 @@ def benchmark_latency():
 
     if device == "cuda":
         config = GemmaConfig.gemma_26b_moe()
+        config.quant_method = "w4a16"
         dtype = torch.bfloat16
     else:
         config = GemmaConfig.gemma_test_small()

@@ -50,6 +50,10 @@ class GemmaConfig:
         return cls()
 
     @classmethod
+    def gemma_26b_moe(cls) -> "GemmaConfig":
+        return cls()
+
+    @classmethod
     def gemma_test_small(cls) -> "GemmaConfig":
         return cls(
             vocab_size=1000,

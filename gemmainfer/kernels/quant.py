@@ -37,6 +37,35 @@ def pack_to_marlin_w4a16(
     return packed_weight, scales
 
 
+def marlin_forward(
+    x_2d: torch.Tensor,
+    packed_weight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    out_features: int,
+) -> torch.Tensor:
+    M = x_2d.size(0)
+    out = torch.empty((M, out_features), dtype=x_2d.dtype, device=x_2d.device)
+    if _HAS_CSRC and x_2d.is_cuda:
+        gemmainfer_csrc.marlin_w4a16(
+            x_2d,
+            packed_weight,
+            scales,
+            out,
+            group_size,
+        )
+    else:
+        K = x_2d.size(1)
+        w_unpacked = torch.empty((K, out_features), dtype=x_2d.dtype, device=x_2d.device)
+        for i in range(8):
+            val = ((packed_weight >> (i * 4)) & 0x0F) - 8
+            group_idx = (torch.arange(K // 8, device=x_2d.device) * 8 + i) // group_size
+            scale = scales[group_idx, :]
+            w_unpacked[i::8, :] = (val.to(x_2d.dtype) * scale)
+        out = torch.matmul(x_2d, w_unpacked)
+    return out
+
+
 class MarlinLinear(nn.Module):
     def __init__(
         self,
@@ -84,29 +113,7 @@ class MarlinLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
         x_2d = x.view(-1, self.in_features).contiguous()
-        M = x_2d.size(0)
-
-        out = torch.empty((M, self.out_features), dtype=x.dtype, device=x.device)
-
-        if _HAS_CSRC:
-            gemmainfer_csrc.marlin_w4a16(
-                x_2d,
-                self.packed_weight,
-                self.scales,
-                out,
-                self.group_size,
-            )
-        else:
-            K, N = self.in_features, self.out_features
-            w_unpacked = torch.empty((K, N), dtype=x.dtype, device=x.device)
-            for i in range(8):
-                val = ((self.packed_weight >> (i * 4)) & 0x0F) - 8
-                group_idx = (torch.arange(K // 8, device=x.device) * 8 + i) // self.group_size
-                scale = self.scales[group_idx, :]
-                w_unpacked[i::8, :] = (val.to(x.dtype) * scale)
-            out = torch.matmul(x_2d, w_unpacked)
-
+        out = marlin_forward(x_2d, self.packed_weight, self.scales, self.group_size, self.out_features)
         if self.bias is not None:
             out += self.bias
-
         return out.view(*orig_shape[:-1], self.out_features)

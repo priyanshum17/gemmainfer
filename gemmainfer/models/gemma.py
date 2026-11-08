@@ -7,28 +7,55 @@ from gemmainfer.models.config import GemmaConfig
 from gemmainfer.kernels.norm import GemmaRMSNorm
 from gemmainfer.kernels.activations import GemmaMLP, apply_logit_softcapping
 from gemmainfer.kernels.attention import GemmaAttention
+from gemmainfer.kernels.quant import marlin_forward
 
 
 class GemmaBatchedMoE(nn.Module):
     def __init__(self, config: GemmaConfig):
         super().__init__()
+        self.config = config
         self.num_experts = config.num_routed_experts
         self.top_k = config.num_experts_per_tok
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
+        self.quant_method = config.quant_method
 
         self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
         self.gate_norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=False)
         self.expert_scale = nn.Parameter(torch.ones(self.num_experts))
 
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, config.hidden_size, 2 * self.moe_intermediate_size)
-        )
-        self.down_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.moe_intermediate_size, config.hidden_size)
-        )
-        nn.init.normal_(self.gate_up_proj, std=0.02)
-        nn.init.normal_(self.down_proj, std=0.02)
+        if self.quant_method == "w4a16":
+            gu_in, gu_out = config.hidden_size, 2 * self.moe_intermediate_size
+            d_in, d_out = self.moe_intermediate_size, config.hidden_size
+            self.gu_group_size = 64 if gu_in % 128 != 0 and gu_in % 64 == 0 else 128
+            self.d_group_size = 64 if d_in % 128 != 0 and d_in % 64 == 0 else 128
+
+            dtype = getattr(torch, config.dtype, torch.bfloat16)
+            self.register_buffer(
+                "gate_up_packed",
+                torch.zeros(self.num_experts, gu_in // 8, gu_out, dtype=torch.int32),
+            )
+            self.register_buffer(
+                "gate_up_scales",
+                torch.zeros(self.num_experts, gu_in // self.gu_group_size, gu_out, dtype=dtype),
+            )
+            self.register_buffer(
+                "down_packed",
+                torch.zeros(self.num_experts, d_in // 8, d_out, dtype=torch.int32),
+            )
+            self.register_buffer(
+                "down_scales",
+                torch.zeros(self.num_experts, d_in // self.d_group_size, d_out, dtype=dtype),
+            )
+        else:
+            self.gate_up_proj = nn.Parameter(
+                torch.empty(self.num_experts, config.hidden_size, 2 * self.moe_intermediate_size)
+            )
+            self.down_proj = nn.Parameter(
+                torch.empty(self.num_experts, self.moe_intermediate_size, config.hidden_size)
+            )
+            nn.init.normal_(self.gate_up_proj, std=0.02)
+            nn.init.normal_(self.down_proj, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
@@ -46,6 +73,23 @@ class GemmaBatchedMoE(nn.Module):
 
         out = torch.zeros_like(x_flat)
         is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+        if self.quant_method == "w4a16":
+            for t in range(num_tokens):
+                tok_x = x_flat[t : t + 1]
+                for k in range(self.top_k):
+                    e_idx = indices[t, k]
+                    w = weights[t, k]
+                    p_gu = self.gate_up_packed[e_idx]
+                    s_gu = self.gate_up_scales[e_idx]
+                    gu = marlin_forward(tok_x, p_gu, s_gu, self.gu_group_size, 2 * self.moe_intermediate_size)
+                    gate, up = gu.chunk(2, dim=-1)
+                    act = F.gelu(gate, approximate="tanh") * up
+                    p_d = self.down_packed[e_idx]
+                    s_d = self.down_scales[e_idx]
+                    expert_out = marlin_forward(act, p_d, s_d, self.d_group_size, self.hidden_size)
+                    out[t : t + 1] = out[t : t + 1] + expert_out * w
+            return out.view(orig_shape)
 
         if num_tokens <= 64 or is_capturing:
             for k in range(self.top_k):
