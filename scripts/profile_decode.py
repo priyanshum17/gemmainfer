@@ -45,8 +45,10 @@ def profile_decode():
     print("Running instrumented single-token decode profiling...")
 
     # Initialize a clean sequence and KV cache for step-level profiling
-    past_kv = model.init_kv_cache(batch_size=1, max_seq_len=2048, device=model.device, dtype=model.dtype)
-    input_tensor = torch.tensor(input_ids, dtype=torch.long, device=model.device).unsqueeze(0)
+    device = engine.device
+    dtype = engine.dtype
+    past_kv = model.init_kv_cache(batch_size=1, max_seq_len=2048, device=device, dtype=dtype)
+    input_tensor = torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0)
     logits, past_kv = model(input_tensor, past_key_values=past_kv, return_logits_only_last=True)
     curr_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(0).unsqueeze(0)
 
