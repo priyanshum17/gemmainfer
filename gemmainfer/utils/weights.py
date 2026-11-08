@@ -69,17 +69,17 @@ def load_gemma_from_hf(
                     t = f.get_tensor(k)
 
                     if clean_k == "model.embed_tokens.weight":
-                        model.model.embed_tokens.weight.data.copy_(t.to(device=device, dtype=dtype))
+                        model.embed_tokens.weight.data.copy_(t.to(device=device, dtype=dtype))
                         continue
 
                     if clean_k == "model.norm.weight":
-                        model.model.norm.weight.data.copy_(t.to(device=device, dtype=dtype))
+                        model.norm.weight.data.copy_(t.to(device=device, dtype=dtype))
                         continue
 
                     parts = clean_k.split(".")
                     if len(parts) >= 4 and parts[1] == "layers":
                         layer_idx = int(parts[2])
-                        layer = model.model.layers[layer_idx]
+                        layer = model.layers[layer_idx]
                         suffix = ".".join(parts[3:])
 
                         if suffix == "input_layernorm.weight":
@@ -135,6 +135,6 @@ def load_gemma_from_hf(
                             elif proj_name == "up_proj" and param_type == "weight_scale":
                                 layer.moe.gate_up_scales[exp_idx, :, layer.moe.moe_intermediate_size:].copy_(t.t().to(device=device, dtype=dtype))
 
-        model.lm_head.weight = model.model.embed_tokens.weight
+        model.lm_head.weight = model.embed_tokens.weight
 
     return model, config
