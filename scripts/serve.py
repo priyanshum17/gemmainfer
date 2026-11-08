@@ -227,7 +227,7 @@ def main():
         model=model,
         device=args.device,
         dtype=dtype,
-        enable_cuda_graphs=True,
+        enable_cuda_graphs=False,
         enable_dspark=True,
     )
 
