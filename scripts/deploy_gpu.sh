@@ -49,10 +49,11 @@ if [ ! -d "${VENV_DIR}" ]; then
 fi
 source "${VENV_DIR}/bin/activate"
 
-# 4. Install Dependencies (Ninja + PyTorch CUDA 12.1 + Requirements)
-echo "[INFO] Installing PyTorch with CUDA 12.1 support and build dependencies..."
+# 4. Install Dependencies (Ninja + PyTorch + Requirements)
+echo "[INFO] Installing PyTorch with CUDA support and build dependencies..."
+export UV_HTTP_TIMEOUT=300
 uv pip install ninja
-uv pip install "torch==2.5.1" --extra-index-url https://download.pytorch.org/whl/cu121
+uv pip install torch
 uv pip install --no-build-isolation -e ".[dev,serve]"
 
 # 5. Compile C++/CUDA Kernels

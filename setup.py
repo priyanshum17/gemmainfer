@@ -43,7 +43,7 @@ if HAS_TORCH:
         ]
         extra_compile_args["nvcc"] = [
             "-O3",
-            "-std=c++17",
+            "-std=c++20",
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
