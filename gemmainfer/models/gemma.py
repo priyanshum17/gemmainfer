@@ -82,18 +82,20 @@ class GemmaBatchedMoE(nn.Module):
         is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
         if self.quant_method == "w4a16":
-            if num_tokens == 1 and _HAS_CSRC and hasattr(gemmainfer_csrc, "fused_batched_moe") and not is_capturing:
-                gemmainfer_csrc.fused_batched_moe(
-                    x_flat,
-                    self.gate_up_packed,
-                    self.gate_up_scales,
-                    self.down_packed,
-                    self.down_scales,
-                    indices[0],
-                    weights[0],
-                    out,
-                    self.gu_group_size,
-                )
+            if _HAS_CSRC and hasattr(gemmainfer_csrc, "fused_batched_moe") and not is_capturing and num_tokens <= 16:
+                for t in range(num_tokens):
+                    out_t = out[t : t + 1]
+                    gemmainfer_csrc.fused_batched_moe(
+                        x_flat[t : t + 1],
+                        self.gate_up_packed,
+                        self.gate_up_scales,
+                        self.down_packed,
+                        self.down_scales,
+                        indices[t],
+                        weights[t],
+                        out_t,
+                        self.gu_group_size,
+                    )
                 return out.view(orig_shape)
 
             for k in range(self.top_k):
