@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 
 class PromptLookupCache:
-    def __init__(self, ngram_size: int = 3, max_draft_len: int = 4):
+    def __init__(self, ngram_size: int = 2, max_draft_len: int = 4):
         self.ngram_size = ngram_size
         self.max_draft_len = max_draft_len
 

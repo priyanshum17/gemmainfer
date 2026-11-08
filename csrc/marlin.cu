@@ -82,7 +82,16 @@ __global__ void fused_moe_gate_up_kernel(
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int k_idx = blockIdx.y;
 
-    if (col >= I || k_idx >= top_k) return;
+    if (k_idx >= top_k) return;
+
+    extern __shared__ char smem_gu[];
+    scalar_t* s_A = reinterpret_cast<scalar_t*>(smem_gu);
+    for (int idx = threadIdx.x; idx < K; idx += blockDim.x) {
+        s_A[idx] = A[idx];
+    }
+    __syncthreads();
+
+    if (col >= I) return;
 
     int expert_id = expert_indices[k_idx];
     if (expert_id < 0 || expert_id >= num_experts) return;
@@ -102,6 +111,7 @@ __global__ void fused_moe_gate_up_kernel(
         float scale_gate = static_cast<float>(S_expert[g * stride_2I + col]);
         float scale_up = static_cast<float>(S_expert[g * stride_2I + (col + I)]);
         int pk_base = g * words_per_group;
+        int k_base = g * group_size;
         float group_gate = 0.0f;
         float group_up = 0.0f;
 
@@ -110,11 +120,11 @@ __global__ void fused_moe_gate_up_kernel(
             int pk = pk_base + w;
             int32_t packed_gate = B_expert[pk * stride_2I + col];
             int32_t packed_up = B_expert[pk * stride_2I + (col + I)];
-            int k_base = pk * 8;
+            int local_k = k_base + w * 8;
 
             #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                float a = static_cast<float>(A[k_base + i]);
+                float a = static_cast<float>(s_A[local_k + i]);
 
                 int32_t w_raw_gate = (packed_gate >> (i * 4)) & 0x0F;
                 group_gate += a * static_cast<float>(w_raw_gate - 8);
@@ -145,12 +155,24 @@ __global__ void marlin_w4a16_splitk_kernel(
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int k_slice = blockIdx.y;
 
-    if (col >= N || k_slice >= split_k) return;
+    if (k_slice >= split_k) return;
 
     int num_groups = K / group_size;
     int groups_per_slice = (num_groups + split_k - 1) / split_k;
     int g_start = k_slice * groups_per_slice;
     int g_end = min(g_start + groups_per_slice, num_groups);
+
+    int k_start = g_start * group_size;
+    int k_slice_len = (g_end - g_start) * group_size;
+
+    extern __shared__ char smem_splitk[];
+    scalar_t* s_A = reinterpret_cast<scalar_t*>(smem_splitk);
+    for (int idx = threadIdx.x; idx < k_slice_len; idx += blockDim.x) {
+        s_A[idx] = A[k_start + idx];
+    }
+    __syncthreads();
+
+    if (col >= N) return;
 
     int words_per_group = group_size / 8;
     float slice_acc = 0.0f;
@@ -158,20 +180,21 @@ __global__ void marlin_w4a16_splitk_kernel(
     for (int g = g_start; g < g_end; ++g) {
         float scale = static_cast<float>(scales[g * N + col]);
         int pk_base = g * words_per_group;
+        int k_local_base = (g - g_start) * group_size;
         float group_acc = 0.0f;
 
         #pragma unroll
         for (int w = 0; w < words_per_group; ++w) {
             int pk = pk_base + w;
             int32_t packed_val = B_packed[pk * N + col];
-            int k_base = pk * 8;
+            int local_k = k_local_base + w * 8;
 
             #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                int k = k_base + i;
+                int k = local_k + i;
                 int32_t w_raw = (packed_val >> (i * 4)) & 0x0F;
                 float w = static_cast<float>(w_raw - 8);
-                float a = static_cast<float>(A[k]);
+                float a = static_cast<float>(s_A[k]);
                 group_acc += a * w;
             }
         }
@@ -198,13 +221,22 @@ __global__ void fused_moe_down_accum_kernel(
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int k_idx = blockIdx.y;
 
-    if (col >= K || k_idx >= top_k) return;
+    if (k_idx >= top_k) return;
+
+    extern __shared__ char smem_down[];
+    scalar_t* s_act = reinterpret_cast<scalar_t*>(smem_down);
+    const scalar_t* act_k = out_acts + k_idx * I;
+    for (int idx = threadIdx.x; idx < I; idx += blockDim.x) {
+        s_act[idx] = act_k[idx];
+    }
+    __syncthreads();
+
+    if (col >= K) return;
 
     int expert_id = expert_indices[k_idx];
     if (expert_id < 0 || expert_id >= num_experts) return;
 
     float weight = static_cast<float>(expert_weights[k_idx]);
-    const scalar_t* act_k = out_acts + k_idx * I;
 
     int packed_I = I / 8;
     int num_groups = I / group_size;
@@ -218,17 +250,18 @@ __global__ void fused_moe_down_accum_kernel(
     for (int g = 0; g < num_groups; ++g) {
         float scale = static_cast<float>(S_expert[g * K + col]);
         int pk_base = g * words_per_group;
+        int i_local_base = g * group_size;
         float group_acc = 0.0f;
 
         #pragma unroll
         for (int w = 0; w < words_per_group; ++w) {
             int pk = pk_base + w;
             int32_t packed_val = B_expert[pk * K + col];
-            int i_base = pk * 8;
+            int local_i = i_local_base + w * 8;
 
             #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                float a = static_cast<float>(act_k[i_base + i]);
+                float a = static_cast<float>(s_act[local_i + i]);
                 int32_t w_raw = (packed_val >> (i * 4)) & 0x0F;
                 group_acc += a * static_cast<float>(w_raw - 8);
             }
@@ -264,8 +297,11 @@ void launch_fused_batched_moe(
     dim3 grid_gu((I + threads - 1) / threads, top_k);
     dim3 grid_down((K + threads - 1) / threads, top_k);
 
+    size_t smem_gu = K * x.element_size();
+    size_t smem_down = I * x.element_size();
+
     if (x.scalar_type() == torch::kBFloat16) {
-        fused_moe_gate_up_kernel<__nv_bfloat16><<<grid_gu, threads>>>(
+        fused_moe_gate_up_kernel<__nv_bfloat16><<<grid_gu, threads, smem_gu>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
             gate_up_packed.data_ptr<int32_t>(),
             reinterpret_cast<const __nv_bfloat16*>(gate_up_scales.data_ptr<at::BFloat16>()),
@@ -274,7 +310,7 @@ void launch_fused_batched_moe(
             K, I, group_size, num_experts, top_k
         );
 
-        fused_moe_down_accum_kernel<__nv_bfloat16><<<grid_down, threads>>>(
+        fused_moe_down_accum_kernel<__nv_bfloat16><<<grid_down, threads, smem_down>>>(
             reinterpret_cast<const __nv_bfloat16*>(out_acts.data_ptr<at::BFloat16>()),
             down_packed.data_ptr<int32_t>(),
             reinterpret_cast<const __nv_bfloat16*>(down_scales.data_ptr<at::BFloat16>()),
@@ -284,7 +320,7 @@ void launch_fused_batched_moe(
             I, K, group_size, num_experts, top_k
         );
     } else if (x.scalar_type() == torch::kFloat16) {
-        fused_moe_gate_up_kernel<half><<<grid_gu, threads>>>(
+        fused_moe_gate_up_kernel<half><<<grid_gu, threads, smem_gu>>>(
             reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
             gate_up_packed.data_ptr<int32_t>(),
             reinterpret_cast<const half*>(gate_up_scales.data_ptr<at::Half>()),
@@ -293,7 +329,7 @@ void launch_fused_batched_moe(
             K, I, group_size, num_experts, top_k
         );
 
-        fused_moe_down_accum_kernel<half><<<grid_down, threads>>>(
+        fused_moe_down_accum_kernel<half><<<grid_down, threads, smem_down>>>(
             reinterpret_cast<const half*>(out_acts.data_ptr<at::Half>()),
             down_packed.data_ptr<int32_t>(),
             reinterpret_cast<const half*>(down_scales.data_ptr<at::Half>()),
@@ -303,7 +339,7 @@ void launch_fused_batched_moe(
             I, K, group_size, num_experts, top_k
         );
     } else {
-        fused_moe_gate_up_kernel<float><<<grid_gu, threads>>>(
+        fused_moe_gate_up_kernel<float><<<grid_gu, threads, smem_gu>>>(
             x.data_ptr<float>(),
             gate_up_packed.data_ptr<int32_t>(),
             gate_up_scales.data_ptr<float>(),
@@ -312,7 +348,7 @@ void launch_fused_batched_moe(
             K, I, group_size, num_experts, top_k
         );
 
-        fused_moe_down_accum_kernel<float><<<grid_down, threads>>>(
+        fused_moe_down_accum_kernel<float><<<grid_down, threads, smem_down>>>(
             out_acts.data_ptr<float>(),
             down_packed.data_ptr<int32_t>(),
             down_scales.data_ptr<float>(),
@@ -343,9 +379,10 @@ void launch_marlin_w4a16(
         dim3 grid(blocks_x, split_k);
         dim3 block(threads_x, 1);
         C.zero_();
+        size_t smem_splitk = ((K + split_k - 1) / split_k) * A.element_size();
 
         if (A.scalar_type() == torch::kBFloat16) {
-            marlin_w4a16_splitk_kernel<__nv_bfloat16><<<grid, block>>>(
+            marlin_w4a16_splitk_kernel<__nv_bfloat16><<<grid, block, smem_splitk>>>(
                 reinterpret_cast<const __nv_bfloat16*>(A.data_ptr<at::BFloat16>()),
                 B_packed.data_ptr<int32_t>(),
                 reinterpret_cast<const __nv_bfloat16*>(scales.data_ptr<at::BFloat16>()),
@@ -353,7 +390,7 @@ void launch_marlin_w4a16(
                 K, N, group_size, split_k
             );
         } else if (A.scalar_type() == torch::kFloat16) {
-            marlin_w4a16_splitk_kernel<half><<<grid, block>>>(
+            marlin_w4a16_splitk_kernel<half><<<grid, block, smem_splitk>>>(
                 reinterpret_cast<const half*>(A.data_ptr<at::Half>()),
                 B_packed.data_ptr<int32_t>(),
                 reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
@@ -361,7 +398,7 @@ void launch_marlin_w4a16(
                 K, N, group_size, split_k
             );
         } else {
-            marlin_w4a16_splitk_kernel<float><<<grid, block>>>(
+            marlin_w4a16_splitk_kernel<float><<<grid, block, smem_splitk>>>(
                 A.data_ptr<float>(),
                 B_packed.data_ptr<int32_t>(),
                 scales.data_ptr<float>(),
