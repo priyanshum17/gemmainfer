@@ -132,6 +132,56 @@ __global__ void fused_moe_gate_up_kernel(
 }
 
 template <typename scalar_t>
+__global__ void marlin_w4a16_splitk_kernel(
+    const scalar_t* __restrict__ A,          // [1, K]
+    const int32_t* __restrict__ B_packed,    // [K / 8, N]
+    const scalar_t* __restrict__ scales,      // [K / group_size, N]
+    scalar_t* __restrict__ C,                 // [1, N]
+    int K,
+    int N,
+    int group_size,
+    int split_k
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int k_slice = blockIdx.y;
+
+    if (col >= N || k_slice >= split_k) return;
+
+    int num_groups = K / group_size;
+    int groups_per_slice = (num_groups + split_k - 1) / split_k;
+    int g_start = k_slice * groups_per_slice;
+    int g_end = min(g_start + groups_per_slice, num_groups);
+
+    int words_per_group = group_size / 8;
+    float slice_acc = 0.0f;
+
+    for (int g = g_start; g < g_end; ++g) {
+        float scale = static_cast<float>(scales[g * N + col]);
+        int pk_base = g * words_per_group;
+        float group_acc = 0.0f;
+
+        #pragma unroll
+        for (int w = 0; w < words_per_group; ++w) {
+            int pk = pk_base + w;
+            int32_t packed_val = B_packed[pk * N + col];
+            int k_base = pk * 8;
+
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int k = k_base + i;
+                int32_t w_raw = (packed_val >> (i * 4)) & 0x0F;
+                float w = static_cast<float>(w_raw - 8);
+                float a = static_cast<float>(A[k]);
+                group_acc += a * w;
+            }
+        }
+        slice_acc += group_acc * scale;
+    }
+
+    atomicAdd(&C[col], static_cast<scalar_t>(slice_acc));
+}
+
+template <typename scalar_t>
 __global__ void fused_moe_down_accum_kernel(
     const scalar_t* __restrict__ out_acts,        // [top_k, I]
     const int32_t* __restrict__ down_all_packed,  // [num_experts, I / 8, K]
@@ -146,51 +196,47 @@ __global__ void fused_moe_down_accum_kernel(
     int top_k
 ) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (col >= K) return;
+    int k_idx = blockIdx.y;
+
+    if (col >= K || k_idx >= top_k) return;
+
+    int expert_id = expert_indices[k_idx];
+    if (expert_id < 0 || expert_id >= num_experts) return;
+
+    float weight = static_cast<float>(expert_weights[k_idx]);
+    const scalar_t* act_k = out_acts + k_idx * I;
 
     int packed_I = I / 8;
     int num_groups = I / group_size;
     int words_per_group = group_size / 8;
 
-    float total_acc = 0.0f;
+    const int32_t* B_expert = down_all_packed + static_cast<size_t>(expert_id) * packed_I * K;
+    const scalar_t* S_expert = down_scales_all + static_cast<size_t>(expert_id) * num_groups * K;
 
-    for (int k_idx = 0; k_idx < top_k; ++k_idx) {
-        int expert_id = expert_indices[k_idx];
-        if (expert_id < 0 || expert_id >= num_experts) continue;
+    float expert_acc = 0.0f;
 
-        float weight = static_cast<float>(expert_weights[k_idx]);
-        const scalar_t* act_k = out_acts + k_idx * I;
+    for (int g = 0; g < num_groups; ++g) {
+        float scale = static_cast<float>(S_expert[g * K + col]);
+        int pk_base = g * words_per_group;
+        float group_acc = 0.0f;
 
-        const int32_t* B_expert = down_all_packed + static_cast<size_t>(expert_id) * packed_I * K;
-        const scalar_t* S_expert = down_scales_all + static_cast<size_t>(expert_id) * num_groups * K;
-
-        float expert_acc = 0.0f;
-
-        for (int g = 0; g < num_groups; ++g) {
-            float scale = static_cast<float>(S_expert[g * K + col]);
-            int pk_base = g * words_per_group;
-            float group_acc = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < words_per_group; ++w) {
+            int pk = pk_base + w;
+            int32_t packed_val = B_expert[pk * K + col];
+            int i_base = pk * 8;
 
             #pragma unroll
-            for (int w = 0; w < words_per_group; ++w) {
-                int pk = pk_base + w;
-                int32_t packed_val = B_expert[pk * K + col];
-                int i_base = pk * 8;
-
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    float a = static_cast<float>(act_k[i_base + i]);
-                    int32_t w_raw = (packed_val >> (i * 4)) & 0x0F;
-                    group_acc += a * static_cast<float>(w_raw - 8);
-                }
+            for (int i = 0; i < 8; ++i) {
+                float a = static_cast<float>(act_k[i_base + i]);
+                int32_t w_raw = (packed_val >> (i * 4)) & 0x0F;
+                group_acc += a * static_cast<float>(w_raw - 8);
             }
-            expert_acc += group_acc * scale;
         }
-
-        total_acc += expert_acc * weight;
+        expert_acc += group_acc * scale;
     }
 
-    out[col] += static_cast<scalar_t>(total_acc);
+    atomicAdd(&out[col], static_cast<scalar_t>(expert_acc * weight));
 }
 
 void launch_fused_batched_moe(
@@ -216,7 +262,7 @@ void launch_fused_batched_moe(
 
     int threads = 128;
     dim3 grid_gu((I + threads - 1) / threads, top_k);
-    dim3 grid_down((K + threads - 1) / threads, 1);
+    dim3 grid_down((K + threads - 1) / threads, top_k);
 
     if (x.scalar_type() == torch::kBFloat16) {
         fused_moe_gate_up_kernel<__nv_bfloat16><<<grid_gu, threads>>>(
@@ -291,6 +337,41 @@ void launch_marlin_w4a16(
 
     int threads_x = 128;
     int blocks_x = (N + threads_x - 1) / threads_x;
+
+    if (M == 1) {
+        int split_k = 8;
+        dim3 grid(blocks_x, split_k);
+        dim3 block(threads_x, 1);
+        C.zero_();
+
+        if (A.scalar_type() == torch::kBFloat16) {
+            marlin_w4a16_splitk_kernel<__nv_bfloat16><<<grid, block>>>(
+                reinterpret_cast<const __nv_bfloat16*>(A.data_ptr<at::BFloat16>()),
+                B_packed.data_ptr<int32_t>(),
+                reinterpret_cast<const __nv_bfloat16*>(scales.data_ptr<at::BFloat16>()),
+                reinterpret_cast<__nv_bfloat16*>(C.data_ptr<at::BFloat16>()),
+                K, N, group_size, split_k
+            );
+        } else if (A.scalar_type() == torch::kFloat16) {
+            marlin_w4a16_splitk_kernel<half><<<grid, block>>>(
+                reinterpret_cast<const half*>(A.data_ptr<at::Half>()),
+                B_packed.data_ptr<int32_t>(),
+                reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+                reinterpret_cast<half*>(C.data_ptr<at::Half>()),
+                K, N, group_size, split_k
+            );
+        } else {
+            marlin_w4a16_splitk_kernel<float><<<grid, block>>>(
+                A.data_ptr<float>(),
+                B_packed.data_ptr<int32_t>(),
+                scales.data_ptr<float>(),
+                C.data_ptr<float>(),
+                K, N, group_size, split_k
+            );
+        }
+        return;
+    }
+
     dim3 grid(blocks_x, M);
     dim3 block(threads_x, 1);
 
