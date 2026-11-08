@@ -75,20 +75,28 @@ class GemmaBatchedMoE(nn.Module):
         is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
         if self.quant_method == "w4a16":
-            for t in range(num_tokens):
-                tok_x = x_flat[t : t + 1]
-                for k in range(self.top_k):
-                    e_idx = indices[t, k]
-                    w = weights[t, k]
-                    p_gu = self.gate_up_packed[e_idx]
-                    s_gu = self.gate_up_scales[e_idx]
-                    gu = marlin_forward(tok_x, p_gu, s_gu, self.gu_group_size, 2 * self.moe_intermediate_size)
+            for k in range(self.top_k):
+                e_idx = indices[:, k]
+                w = weights[:, k : k + 1]
+                p_gu = self.gate_up_packed[e_idx]
+                s_gu = self.gate_up_scales[e_idx]
+                p_d = self.down_packed[e_idx]
+                s_d = self.down_scales[e_idx]
+
+                if num_tokens == 1:
+                    gu = marlin_forward(x_flat, p_gu.squeeze(0), s_gu.squeeze(0), self.gu_group_size, 2 * self.moe_intermediate_size)
                     gate, up = gu.chunk(2, dim=-1)
                     act = F.gelu(gate, approximate="tanh") * up
-                    p_d = self.down_packed[e_idx]
-                    s_d = self.down_scales[e_idx]
-                    expert_out = marlin_forward(act, p_d, s_d, self.d_group_size, self.hidden_size)
-                    out[t : t + 1] = out[t : t + 1] + expert_out * w
+                    expert_out = marlin_forward(act, p_d.squeeze(0), s_d.squeeze(0), self.d_group_size, self.hidden_size)
+                    out = out + expert_out * w
+                else:
+                    for t in range(num_tokens):
+                        tok_x = x_flat[t : t + 1]
+                        gu = marlin_forward(tok_x, p_gu[t], s_gu[t], self.gu_group_size, 2 * self.moe_intermediate_size)
+                        gate, up = gu.chunk(2, dim=-1)
+                        act = F.gelu(gate, approximate="tanh") * up
+                        expert_out = marlin_forward(act, p_d[t], s_d[t], self.d_group_size, self.hidden_size)
+                        out[t : t + 1] = out[t : t + 1] + expert_out * w[t : t + 1]
             return out.view(orig_shape)
 
         if num_tokens <= 64 or is_capturing:
