@@ -114,42 +114,55 @@ class GemmaInferEngine:
         if full_idx is None:
             full_idx = len(past_kv) - 1
 
+        # Run 1 step on next_token to synchronize KV cache and hidden state
+        curr_token_tensor[0, 0] = next_token
+        logits, past_kv, last_h = self.model(
+            curr_token_tensor,
+            past_key_values=past_kv,
+            return_logits_only_last=True,
+            return_hidden_states=True,
+        )
+        predicted_next = torch.argmax(logits[:, -1, :], dim=-1).item()
+
         while not seq.is_finished:
             tokens_so_far = seq.prompt_token_ids + seq.output_token_ids
+            orig_kv_len = past_kv[0][2][0] if isinstance(past_kv[0], tuple) and len(past_kv[0]) == 3 else past_kv[0][0].shape[2]
 
-            if self.dspark is not None:
-                orig_kv_len = past_kv[0][2][0] if isinstance(past_kv[0], tuple) and len(past_kv[0]) == 3 else past_kv[0][0].shape[2]
+            if self.dspark is not None and self.dspark.assistant_drafter is not None:
                 shared_kv = {
                     "sliding_attention": (past_kv[sliding_idx][0], past_kv[sliding_idx][1]),
                     "full_attention": (past_kv[full_idx][0], past_kv[full_idx][1]),
                 }
-                t0_draft = time.perf_counter()
                 draft = self.dspark.propose_draft(
                     tokens=tokens_so_far,
                     last_hidden_state=last_h,
                     shared_kv=shared_kv,
                     cur_pos=orig_kv_len,
                 )
-                t_draft_ms = (time.perf_counter() - t0_draft) * 1000.0
-                if draft:
-                    cand_tokens = [seq.output_token_ids[-1]] + draft
-                    cand_tensor = torch.tensor(cand_tokens, dtype=torch.long, device=self.device).unsqueeze(0)
-                    t0_verify = time.perf_counter()
+                if draft and draft[0] == predicted_next:
+                    draft_tensor = torch.tensor([draft], dtype=torch.long, device=self.device)
                     all_logits, past_kv, all_hidden = self.model(
-                        cand_tensor,
+                        draft_tensor,
                         past_key_values=past_kv,
                         return_logits_only_last=False,
                         return_hidden_states=True,
                     )
-                    t_verify_ms = (time.perf_counter() - t0_verify) * 1000.0
-                    accepted, n_matches = self.dspark.verify_tokens(
-                        draft_tokens=draft,
-                        logits=all_logits[0],
-                        temperature=temperature,
-                    )
-                    print(f"[CYCLE] draft_ms={t_draft_ms:.1f} verify_ms={t_verify_ms:.1f} draft={draft} matches={n_matches} accepted={accepted}", flush=True)
 
-                    retained_len = orig_kv_len + 1 + n_matches
+                    n_matches = 1
+                    accepted = [draft[0]]
+                    for i in range(len(draft) - 1):
+                        target_pred_i = torch.argmax(all_logits[0, i, :], dim=-1).item()
+                        if target_pred_i == draft[i + 1]:
+                            accepted.append(draft[i + 1])
+                            n_matches += 1
+                        else:
+                            accepted.append(target_pred_i)
+                            break
+                    else:
+                        bonus = torch.argmax(all_logits[0, len(draft) - 1, :], dim=-1).item()
+                        accepted.append(bonus)
+
+                    retained_len = orig_kv_len + n_matches
                     if isinstance(past_kv[0], tuple) and len(past_kv[0]) == 3:
                         for layer_kv in past_kv:
                             layer_kv[2][0] = retained_len
@@ -159,27 +172,38 @@ class GemmaInferEngine:
                             for k, v in past_kv
                         ]
 
-                    last_h = all_hidden[:, n_matches : n_matches + 1, :]
-
                     for tok in accepted:
                         seq.append_token(tok)
                         yield tok
                         if tok in eos_tokens or seq.is_finished:
                             return
+
+                    # Compute next step from the newly accepted tail
+                    tail_tok = accepted[-1]
+                    curr_token_tensor[0, 0] = tail_tok
+                    logits, past_kv, last_h = self.model(
+                        curr_token_tensor,
+                        past_key_values=past_kv,
+                        return_logits_only_last=True,
+                        return_hidden_states=True,
+                    )
+                    predicted_next = torch.argmax(logits[:, -1, :], dim=-1).item()
                     continue
 
-            curr_token_tensor[0, 0] = seq.output_token_ids[-1]
+            # Pure autoregression step
+            seq.append_token(predicted_next)
+            yield predicted_next
+            if predicted_next in eos_tokens or seq.is_finished:
+                return
+
+            curr_token_tensor[0, 0] = predicted_next
             logits, past_kv, last_h = self.model(
                 curr_token_tensor,
                 past_key_values=past_kv,
                 return_logits_only_last=True,
                 return_hidden_states=True,
             )
-            next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
-            seq.append_token(next_token)
-            yield next_token
-            if next_token in eos_tokens:
-                break
+            predicted_next = torch.argmax(logits[:, -1, :], dim=-1).item()
 
     @torch.inference_mode()
     def generate(

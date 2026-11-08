@@ -112,9 +112,10 @@ class Gemma4AssistantDrafter:
 
         drafted_tokens = []
 
+        embed_scale = self.embed_tokens.weight.shape[-1] ** 0.5
         for step in range(self.max_draft_len):
-            pos_ids = torch.tensor([[cur_pos + step]], dtype=torch.long, device=device)
-            token_emb = self.embed_tokens(curr_token)
+            pos_ids = torch.tensor([[cur_pos - 1 + step]], dtype=torch.long, device=device)
+            token_emb = self.embed_tokens(curr_token) * embed_scale
             inputs_embeds = torch.cat([token_emb, curr_h], dim=-1)
 
             out = self.assistant(
