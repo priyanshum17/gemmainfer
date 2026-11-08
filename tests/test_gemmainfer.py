@@ -82,6 +82,19 @@ def test_marlin_quantized_batch_m():
     assert not torch.isnan(logits).any()
 
 
+def test_fused_batched_moe_decode():
+    config = GemmaConfig.gemma_test_small()
+    config.quant_method = "w4a16"
+    model = GemmaForCausalLM(config)
+    
+    # Single token decode (M=1) to exercise fused_batched_moe
+    input_ids = torch.randint(0, config.vocab_size, (1, 1))
+    logits, kv = model(input_ids)
+    assert logits.shape == (1, 1, config.vocab_size)
+    assert not torch.isnan(logits).any()
+
+
+
 def test_engine_generate():
     config = GemmaConfig.gemma_test_small()
     engine = GemmaInferEngine(config=config, enable_dspark=True)

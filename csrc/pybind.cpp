@@ -32,6 +32,18 @@ void launch_marlin_w4a16(
     torch::Tensor& C,
     int group_size
 );
+
+void launch_fused_batched_moe(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_packed,
+    const torch::Tensor& gate_up_scales,
+    const torch::Tensor& down_packed,
+    const torch::Tensor& down_scales,
+    const torch::Tensor& expert_indices,
+    const torch::Tensor& expert_weights,
+    torch::Tensor& out,
+    int group_size
+);
 #endif
 
 void cpu_marlin_w4a16(
@@ -142,8 +154,77 @@ void marlin_w4a16_dispatch(
     cpu_marlin_w4a16(A, B_packed, scales, C, group_size);
 }
 
+void cpu_fused_batched_moe(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_packed,
+    const torch::Tensor& gate_up_scales,
+    const torch::Tensor& down_packed,
+    const torch::Tensor& down_scales,
+    const torch::Tensor& expert_indices,
+    const torch::Tensor& expert_weights,
+    torch::Tensor& out,
+    int group_size
+) {
+    int top_k = expert_indices.size(0);
+    int two_I = gate_up_packed.size(2);
+    int I = two_I / 2;
+    int K = x.size(1);
+
+    auto idx_acc = expert_indices.to(torch::kInt64);
+    auto w_acc = expert_weights.to(torch::kFloat32);
+
+    for (int k = 0; k < top_k; ++k) {
+        int64_t e = idx_acc[k].item<int64_t>();
+        float w = w_acc[k].item<float>();
+
+        auto p_gu = gate_up_packed[e];
+        auto s_gu = gate_up_scales[e];
+        auto p_d = down_packed[e];
+        auto s_d = down_scales[e];
+
+        auto gu = torch::zeros({1, two_I}, x.options());
+        cpu_marlin_w4a16(x, p_gu, s_gu, gu, group_size);
+
+        auto gate = gu.slice(1, 0, I);
+        auto up = gu.slice(1, I, two_I);
+        auto act = torch::gelu(gate, "tanh") * up;
+
+        auto expert_out = torch::zeros({1, K}, x.options());
+        cpu_marlin_w4a16(act, p_d, s_d, expert_out, group_size);
+
+        out.add_(expert_out, w);
+    }
+}
+
+void fused_batched_moe_dispatch(
+    const torch::Tensor& x,
+    const torch::Tensor& gate_up_packed,
+    const torch::Tensor& gate_up_scales,
+    const torch::Tensor& down_packed,
+    const torch::Tensor& down_scales,
+    const torch::Tensor& expert_indices,
+    const torch::Tensor& expert_weights,
+    torch::Tensor& out,
+    int group_size
+) {
+#ifdef USE_CUDA
+    if (x.is_cuda()) {
+        launch_fused_batched_moe(
+            x, gate_up_packed, gate_up_scales, down_packed, down_scales,
+            expert_indices, expert_weights, out, group_size
+        );
+        return;
+    }
+#endif
+    cpu_fused_batched_moe(
+        x, gate_up_packed, gate_up_scales, down_packed, down_scales,
+        expert_indices, expert_weights, out, group_size
+    );
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm", &rmsnorm_dispatch);
     m.def("softcapping", &softcapping_dispatch);
     m.def("marlin_w4a16", &marlin_w4a16_dispatch);
+    m.def("fused_batched_moe", &fused_batched_moe_dispatch);
 }

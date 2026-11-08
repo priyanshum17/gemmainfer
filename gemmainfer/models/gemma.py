@@ -9,6 +9,12 @@ from gemmainfer.kernels.activations import GemmaMLP, apply_logit_softcapping
 from gemmainfer.kernels.attention import GemmaAttention
 from gemmainfer.kernels.quant import marlin_forward
 
+try:
+    import gemmainfer_csrc
+    _HAS_CSRC = True
+except ImportError:
+    _HAS_CSRC = False
+
 
 class GemmaBatchedMoE(nn.Module):
     def __init__(self, config: GemmaConfig):
@@ -76,6 +82,20 @@ class GemmaBatchedMoE(nn.Module):
         is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
         if self.quant_method == "w4a16":
+            if num_tokens == 1 and _HAS_CSRC and hasattr(gemmainfer_csrc, "fused_batched_moe") and not is_capturing:
+                gemmainfer_csrc.fused_batched_moe(
+                    x_flat,
+                    self.gate_up_packed,
+                    self.gate_up_scales,
+                    self.down_packed,
+                    self.down_scales,
+                    indices[0],
+                    weights[0],
+                    out,
+                    self.gu_group_size,
+                )
+                return out.view(orig_shape)
+
             for k in range(self.top_k):
                 e_idx = indices[:, k]
                 w = weights[:, k : k + 1]
