@@ -9,9 +9,8 @@ from gemmainfer.kernels.norm import GemmaRMSNorm
 from gemmainfer.kernels.quant import MarlinLinear
 
 
-def _make_linear(in_features: int, out_features: int, bias: bool = False, quant_method: Optional[str] = None) -> nn.Module:
+def _make_linear(in_features: int, out_features: int, bias: bool = False, quant_method: Optional[str] = None, group_size: int = 64) -> nn.Module:
     if quant_method == "w4a16":
-        group_size = 64 if in_features % 128 != 0 and in_features % 64 == 0 else 128
         return MarlinLinear(in_features, out_features, group_size=group_size, bias=bias)
     return nn.Linear(in_features, out_features, bias=bias)
 
@@ -86,14 +85,15 @@ class GemmaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = config.query_pre_attn_scalar or (self.head_dim ** -0.5)
 
-        self.q_proj = _make_linear(self.hidden_size, self.num_heads * self.head_dim, bias=False, quant_method=config.quant_method)
-        self.k_proj = _make_linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, quant_method=config.quant_method)
+        gs = config.quant_group_size
+        self.q_proj = _make_linear(self.hidden_size, self.num_heads * self.head_dim, bias=False, quant_method=config.quant_method, group_size=gs)
+        self.k_proj = _make_linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, quant_method=config.quant_method, group_size=gs)
         if not self.k_eq_v:
-            self.v_proj = _make_linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, quant_method=config.quant_method)
+            self.v_proj = _make_linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, quant_method=config.quant_method, group_size=gs)
         else:
             self.v_proj = None
 
-        self.o_proj = _make_linear(self.num_heads * self.head_dim, self.hidden_size, bias=False, quant_method=config.quant_method)
+        self.o_proj = _make_linear(self.num_heads * self.head_dim, self.hidden_size, bias=False, quant_method=config.quant_method, group_size=gs)
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)

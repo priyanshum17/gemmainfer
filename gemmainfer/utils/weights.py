@@ -42,6 +42,7 @@ def load_gemma_from_hf(
         num_routed_experts=text_cfg.get("num_experts", 128),
         num_experts_per_tok=text_cfg.get("top_k_experts", 8),
         quant_method="w4a16" if is_quant else None,
+        quant_group_size=64,
         dtype="bfloat16" if dtype == torch.bfloat16 else "float16",
     )
 

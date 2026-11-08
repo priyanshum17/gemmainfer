@@ -87,7 +87,7 @@ class MarlinLinear(nn.Module):
         )
         self.register_buffer(
             "scales",
-            torch.zeros((in_features // group_size, out_features), dtype=dtype),
+            torch.full((in_features // group_size, out_features), 0.02, dtype=dtype),
         )
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features, dtype=dtype))

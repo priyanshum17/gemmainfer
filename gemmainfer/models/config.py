@@ -35,6 +35,7 @@ class GemmaConfig:
     
     dtype: str = "bfloat16"
     quant_method: Optional[Literal["w4a16", "fp8", "none"]] = None
+    quant_group_size: int = 64
 
     def __post_init__(self):
         if self.full_attention_layers is None:

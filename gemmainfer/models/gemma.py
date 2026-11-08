@@ -27,8 +27,8 @@ class GemmaBatchedMoE(nn.Module):
         if self.quant_method == "w4a16":
             gu_in, gu_out = config.hidden_size, 2 * self.moe_intermediate_size
             d_in, d_out = self.moe_intermediate_size, config.hidden_size
-            self.gu_group_size = 64 if gu_in % 128 != 0 and gu_in % 64 == 0 else 128
-            self.d_group_size = 64 if d_in % 128 != 0 and d_in % 64 == 0 else 128
+            self.gu_group_size = config.quant_group_size
+            self.d_group_size = config.quant_group_size
 
             dtype = getattr(torch, config.dtype, torch.bfloat16)
             self.register_buffer(
