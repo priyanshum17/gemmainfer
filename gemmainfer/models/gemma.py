@@ -20,8 +20,9 @@ class GemmaBatchedMoE(nn.Module):
         self.moe_intermediate_size = config.moe_intermediate_size
         self.quant_method = config.quant_method
 
+        self.router_norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, with_scale=False)
+        self.router_scale = nn.Parameter(torch.ones(config.hidden_size))
         self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
-        self.gate_norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=False)
         self.expert_scale = nn.Parameter(torch.ones(self.num_experts))
 
         if self.quant_method == "w4a16":
@@ -62,14 +63,14 @@ class GemmaBatchedMoE(nn.Module):
         x_flat = x.view(-1, self.hidden_size)
         num_tokens = x_flat.shape[0]
 
-        x_normed = self.gate_norm(x_flat)
-        router_logits = self.gate(x_normed) * (self.hidden_size ** -0.5)
-        router_probs = F.softmax(router_logits, dim=-1)
+        x_normed = self.router_norm(x_flat) * self.router_scale * (self.hidden_size ** -0.5)
+        router_logits = self.gate(x_normed)
+        router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32)
 
         weights, indices = torch.topk(router_probs, self.top_k, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True)
         scales = self.expert_scale[indices]
-        weights = weights * scales
+        weights = (weights * scales).type_as(x)
 
         out = torch.zeros_like(x_flat)
         is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
@@ -148,20 +149,22 @@ class GemmaDecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
 
         self.pre_feedforward_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
-        
-        if config.has_shared_mlp:
-            self.shared_mlp = GemmaMLP(config.hidden_size, config.intermediate_size, quant_method=config.quant_method)
-            self.shared_mlp_norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
-        else:
-            self.shared_mlp = None
+        self.mlp = GemmaMLP(config.hidden_size, config.intermediate_size, quant_method=config.quant_method, group_size=config.quant_group_size)
 
         if config.is_moe:
+            self.post_feedforward_layernorm_1 = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
+            self.pre_feedforward_layernorm_2 = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
             self.moe = GemmaBatchedMoE(config)
-            self.moe_norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
+            self.post_feedforward_layernorm_2 = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
         else:
             self.moe = None
 
         self.post_feedforward_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
+        self.register_buffer("layer_scalar", torch.ones(1))
+
+    @property
+    def shared_mlp(self):
+        return self.mlp
 
     def forward(
         self,
@@ -182,16 +185,21 @@ class GemmaDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        normed_ffn_in = self.pre_feedforward_layernorm(hidden_states)
+        mlp_in = self.pre_feedforward_layernorm(hidden_states)
+        mlp_out = self.mlp(mlp_in)
 
-        ffn_out = torch.zeros_like(hidden_states)
-        if self.shared_mlp is not None:
-            ffn_out = ffn_out + self.shared_mlp_norm(self.shared_mlp(normed_ffn_in))
         if self.moe is not None:
-            ffn_out = ffn_out + self.moe_norm(self.moe(normed_ffn_in))
+            hidden_states_1 = self.post_feedforward_layernorm_1(mlp_out)
+            moe_in = self.pre_feedforward_layernorm_2(residual)
+            hidden_states_2 = self.moe(moe_in)
+            hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
+            ffn_combined = hidden_states_1 + hidden_states_2
+        else:
+            ffn_combined = mlp_out
 
-        hidden_states = self.post_feedforward_layernorm(ffn_out)
+        hidden_states = self.post_feedforward_layernorm(ffn_combined)
         hidden_states = residual + hidden_states
+        hidden_states = (hidden_states * self.layer_scalar).type_as(hidden_states)
 
         return hidden_states, new_kv
 
@@ -225,7 +233,7 @@ class GemmaForCausalLM(nn.Module):
                 past_len = past_key_values[0][0].shape[2]
                 position_ids = torch.arange(past_len, past_len + seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(bsz, -1)
 
-        hidden_states = self.embed_tokens(input_ids) * (self.config.hidden_size ** 0.5)
+        hidden_states = (self.embed_tokens(input_ids) * (self.config.hidden_size ** 0.5)).to(dtype=self.embed_tokens.weight.dtype)
 
         new_past_key_values = []
         for i, layer in enumerate(self.layers):

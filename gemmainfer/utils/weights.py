@@ -116,7 +116,27 @@ def load_gemma_from_hf(
                         elif suffix == "router.per_expert_scale":
                             layer.moe.expert_scale.data.copy_(t.to(device=device, dtype=dtype))
                         elif suffix == "router.scale":
-                            layer.moe.gate_norm.weight.data.copy_(t.to(device=device, dtype=dtype))
+                            layer.moe.router_scale.data.copy_(t.to(device=device, dtype=dtype))
+                        elif suffix == "pre_feedforward_layernorm_2.weight":
+                            layer.pre_feedforward_layernorm_2.weight.data.copy_(t.to(device=device, dtype=dtype))
+                        elif suffix == "post_feedforward_layernorm_1.weight":
+                            layer.post_feedforward_layernorm_1.weight.data.copy_(t.to(device=device, dtype=dtype))
+                        elif suffix == "post_feedforward_layernorm_2.weight":
+                            layer.post_feedforward_layernorm_2.weight.data.copy_(t.to(device=device, dtype=dtype))
+                        elif suffix == "layer_scalar":
+                            layer.layer_scalar.copy_(t.to(device=device, dtype=dtype))
+                        elif suffix == "mlp.gate_proj.weight_packed":
+                            layer.mlp.gate_proj.packed_weight.data.copy_(t.t().to(device=device))
+                        elif suffix == "mlp.gate_proj.weight_scale":
+                            layer.mlp.gate_proj.scales.data.copy_(t.t().to(device=device, dtype=dtype))
+                        elif suffix == "mlp.up_proj.weight_packed":
+                            layer.mlp.up_proj.packed_weight.data.copy_(t.t().to(device=device))
+                        elif suffix == "mlp.up_proj.weight_scale":
+                            layer.mlp.up_proj.scales.data.copy_(t.t().to(device=device, dtype=dtype))
+                        elif suffix == "mlp.down_proj.weight_packed":
+                            layer.mlp.down_proj.packed_weight.data.copy_(t.t().to(device=device))
+                        elif suffix == "mlp.down_proj.weight_scale":
+                            layer.mlp.down_proj.scales.data.copy_(t.t().to(device=device, dtype=dtype))
                         elif suffix.startswith("experts.") and layer.moe is not None:
                             exp_parts = suffix.split(".")
                             exp_idx = int(exp_parts[1])

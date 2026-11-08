@@ -16,12 +16,21 @@ def _make_linear(in_features: int, out_features: int, bias: bool = False, quant_
 
 
 class GemmaRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_position_embeddings: int = 262144, base: float = 10000.0):
+    def __init__(self, dim: int, max_position_embeddings: int = 262144, base: float = 10000.0, partial_rotary_factor: float = 1.0):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        self.partial_rotary_factor = partial_rotary_factor
+
+        rope_angles = int(partial_rotary_factor * dim // 2)
+        inv_freq_rot = 1.0 / (base ** (torch.arange(0, 2 * rope_angles, 2).float() / dim))
+        nope_angles = dim // 2 - rope_angles
+        if nope_angles > 0:
+            inv_freq = torch.cat([inv_freq_rot, torch.zeros(nope_angles, dtype=torch.float32)], dim=0)
+        else:
+            inv_freq = inv_freq_rot
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._set_cos_sin_cache(seq_len=min(max_position_embeddings, 8192))
 
@@ -97,12 +106,13 @@ class GemmaAttention(nn.Module):
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
-        self.v_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
+        self.v_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
 
         self.rotary_emb = GemmaRotaryEmbedding(
             dim=self.head_dim,
             max_position_embeddings=config.max_position_embeddings,
             base=self.rope_theta,
+            partial_rotary_factor=0.25 if self.is_full else 1.0,
         )
 
     def forward(

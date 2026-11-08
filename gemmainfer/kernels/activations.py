@@ -11,19 +11,18 @@ except ImportError:
     _HAS_CSRC = False
 
 
-def _make_mlp_linear(in_features: int, out_features: int, quant_method: Optional[str] = None) -> nn.Module:
+def _make_mlp_linear(in_features: int, out_features: int, quant_method: Optional[str] = None, group_size: int = 64) -> nn.Module:
     if quant_method == "w4a16":
-        group_size = 64 if in_features % 128 != 0 and in_features % 64 == 0 else 128
         return MarlinLinear(in_features, out_features, group_size=group_size, bias=False)
     return nn.Linear(in_features, out_features, bias=False)
 
 
 class GemmaMLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int, quant_method: Optional[str] = None):
+    def __init__(self, hidden_size: int, intermediate_size: int, quant_method: Optional[str] = None, group_size: int = 64):
         super().__init__()
-        self.gate_proj = _make_mlp_linear(hidden_size, intermediate_size, quant_method=quant_method)
-        self.up_proj = _make_mlp_linear(hidden_size, intermediate_size, quant_method=quant_method)
-        self.down_proj = _make_mlp_linear(intermediate_size, hidden_size, quant_method=quant_method)
+        self.gate_proj = _make_mlp_linear(hidden_size, intermediate_size, quant_method=quant_method, group_size=group_size)
+        self.up_proj = _make_mlp_linear(hidden_size, intermediate_size, quant_method=quant_method, group_size=group_size)
+        self.down_proj = _make_mlp_linear(intermediate_size, hidden_size, quant_method=quant_method, group_size=group_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = F.gelu(self.gate_proj(x), approximate="tanh")

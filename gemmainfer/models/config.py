@@ -41,7 +41,7 @@ class GemmaConfig:
         if self.full_attention_layers is None:
             self.full_attention_layers = [5, 11, 17, 23, 29]
         if self.query_pre_attn_scalar is None:
-            self.query_pre_attn_scalar = self.head_dim ** -0.5
+            self.query_pre_attn_scalar = 1.0
 
     def is_full_attention(self, layer_idx: int) -> bool:
         return layer_idx in self.full_attention_layers

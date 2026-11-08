@@ -9,16 +9,23 @@ except ImportError:
 
 
 class GemmaRMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, add_unit_offset: bool = False):
+    def __init__(self, dim: int, eps: float = 1e-6, add_unit_offset: bool = False, with_scale: bool = True):
         super().__init__()
         self.eps = eps
         self.add_unit_offset = add_unit_offset
-        self.weight = nn.Parameter(torch.zeros(dim) if add_unit_offset else torch.ones(dim))
+        self.with_scale = with_scale
+        if self.with_scale:
+            self.weight = nn.Parameter(torch.zeros(dim) if add_unit_offset else torch.ones(dim))
+        else:
+            self.register_parameter("weight", None)
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.with_scale or self.weight is None:
+            return self._norm(x.float()).type_as(x)
+
         if _HAS_CSRC and x.is_contiguous() and self.weight.is_contiguous():
             out = torch.empty_like(x)
             gemmainfer_csrc.rmsnorm(x, self.weight, out, self.eps, self.add_unit_offset)
