@@ -52,7 +52,7 @@ class GemmaInferEngine:
                 hidden_size=self.config.hidden_size,
                 vocab_size=self.config.vocab_size,
                 confidence_threshold=0.75,
-                max_draft_len=3,
+                max_draft_len=5,
             )
             if enable_dspark
             else None
