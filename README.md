@@ -96,9 +96,3 @@ pytest tests/
 # Benchmark live server endpoint
 python scripts/benchmark_client.py
 ```
-
----
-
-## License
-
-Apache 2.0
