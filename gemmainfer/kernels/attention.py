@@ -26,17 +26,24 @@ class GemmaRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._set_cos_sin_cache(seq_len=min(max_position_embeddings, 8192))
 
-    def _set_cos_sin_cache(self, seq_len: int):
-        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
+    def _set_cos_sin_cache(self, seq_len: int, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
+        device = device or self.inv_freq.device
+        dtype = dtype or torch.get_default_dtype()
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, self.inv_freq.to(device=device, dtype=torch.float32))
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
-    def forward(self, x: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        if seq_len > self.cos_cached.shape[0]:
-            self._set_cos_sin_cache(seq_len=seq_len)
-        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+    def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.cos_cached.device != x.device or self.cos_cached.dtype != x.dtype:
+            self.cos_cached = self.cos_cached.to(device=x.device, dtype=x.dtype)
+            self.sin_cached = self.sin_cached.to(device=x.device, dtype=x.dtype)
+        if seq_len is not None and seq_len > self.cos_cached.shape[0]:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+        if seq_len is not None:
+            return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+        return self.cos_cached, self.sin_cached
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -119,7 +126,7 @@ class GemmaAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = self.v_norm(v).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(v, seq_len=int(position_ids.max().item()) + 1)
+        cos, sin = self.rotary_emb(v)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
         if kv_cache is not None:
