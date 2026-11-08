@@ -222,9 +222,29 @@ void fused_batched_moe_dispatch(
     );
 }
 
+void paged_swa_decode_dispatch(
+    const torch::Tensor& q,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache,
+    const torch::Tensor& block_tables,
+    const torch::Tensor& seq_lens,
+    torch::Tensor& out,
+    int sliding_window,
+    float scale
+) {
+#ifdef USE_CUDA
+    if (q.is_cuda()) {
+        launch_paged_swa_decode(q, k_cache, v_cache, block_tables, seq_lens, out, sliding_window, scale);
+        return;
+    }
+#endif
+    TORCH_CHECK(false, "paged_swa_decode is only implemented for CUDA tensors");
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm", &rmsnorm_dispatch);
     m.def("softcapping", &softcapping_dispatch);
     m.def("marlin_w4a16", &marlin_w4a16_dispatch);
     m.def("fused_batched_moe", &fused_batched_moe_dispatch);
+    m.def("paged_swa_decode", &paged_swa_decode_dispatch);
 }

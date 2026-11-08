@@ -4,7 +4,6 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-template <typename T>
 __device__ __forceinline__ float warp_reduce_max(float val) {
     #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
@@ -13,7 +12,6 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
     return val;
 }
 
-template <typename T>
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
@@ -83,7 +81,7 @@ __global__ void paged_swa_decode_kernel(
         if (dot > thread_max) thread_max = dot;
     }
 
-    float warp_max = warp_reduce_max<float>(thread_max);
+    float warp_max = warp_reduce_max(thread_max);
     if (lane == 0) {
         s_warp_max[warp_id] = warp_max;
     }
@@ -91,7 +89,7 @@ __global__ void paged_swa_decode_kernel(
 
     if (warp_id == 0) {
         float val = (tid < num_warps) ? s_warp_max[tid] : -1e20f;
-        val = warp_reduce_max<float>(val);
+        val = warp_reduce_max(val);
         if (lane == 0) {
             s_block_max = val;
         }
@@ -107,7 +105,7 @@ __global__ void paged_swa_decode_kernel(
         thread_sum += p;
     }
 
-    float warp_sum = warp_reduce_sum<float>(thread_sum);
+    float warp_sum = warp_reduce_sum(thread_sum);
     if (lane == 0) {
         s_warp_sum[warp_id] = warp_sum;
     }
@@ -115,7 +113,7 @@ __global__ void paged_swa_decode_kernel(
 
     if (warp_id == 0) {
         float val = (tid < num_warps) ? s_warp_sum[tid] : 0.0f;
-        val = warp_reduce_sum<float>(val);
+        val = warp_reduce_sum(val);
         if (lane == 0) {
             s_block_inv_sum = (val > 0.0f) ? (1.0f / val) : 0.0f;
         }

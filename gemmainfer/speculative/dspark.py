@@ -1,15 +1,20 @@
-from typing import List, Tuple, Optional, Dict, Any
+import logging
+from typing import List, Tuple, Optional, Dict
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+logger = logging.getLogger("gemmainfer")
 
 
 class PromptLookupCache:
+    """Fast n-gram lookup cache to propose draft tokens matching prompt history."""
+
     def __init__(self, ngram_size: int = 2, max_draft_len: int = 4):
         self.ngram_size = ngram_size
         self.max_draft_len = max_draft_len
 
     def propose(self, token_ids: List[int]) -> List[int]:
+        """Propose speculative draft tokens by searching previous occurrences of the suffix."""
         if len(token_ids) < self.ngram_size:
             return []
 
@@ -25,6 +30,8 @@ class PromptLookupCache:
 
 
 class DSparkSemiAutoregressiveDrafter(nn.Module):
+    """Neural semi-autoregressive drafter with recurrence and confidence-based early stopping."""
+
     def __init__(self, hidden_size: int, vocab_size: int, max_draft_len: int = 4):
         super().__init__()
         self.hidden_size = hidden_size
@@ -41,10 +48,10 @@ class DSparkSemiAutoregressiveDrafter(nn.Module):
         last_hidden_state: torch.Tensor,
         confidence_threshold: float = 0.7,
     ) -> Tuple[List[int], List[float]]:
+        """Generate speculative draft tokens conditioned on the target model's final hidden state."""
         if self.feature_expansion.weight.dtype != last_hidden_state.dtype or self.feature_expansion.weight.device != last_hidden_state.device:
             self.to(device=last_hidden_state.device, dtype=last_hidden_state.dtype)
         bsz = last_hidden_state.shape[0]
-        device = last_hidden_state.device
 
         features = self.feature_expansion(last_hidden_state).view(bsz, self.max_draft_len, self.hidden_size)
         state = last_hidden_state.squeeze(1) if last_hidden_state.dim() == 3 else last_hidden_state
@@ -96,6 +103,7 @@ class Gemma4AssistantDrafter:
         shared_kv: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
         cur_pos: int,
     ) -> List[int]:
+        """Propose draft tokens using companion model and shared KV states."""
         device = last_hidden_state.device
         curr_token = torch.tensor([[last_token_id]], dtype=torch.long, device=device)
         curr_h = last_hidden_state
@@ -140,6 +148,8 @@ class Gemma4AssistantDrafter:
 
 
 class DSparkVerifier:
+    """Multi-tier speculative verification system coordinating neural, companion, and cache drafters."""
+
     def __init__(
         self,
         assistant_model=None,
@@ -174,6 +184,7 @@ class DSparkVerifier:
         shared_kv: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None,
         cur_pos: Optional[int] = None,
     ) -> List[int]:
+        """Propose draft tokens using the best available drafting strategy."""
         if self.assistant_drafter is not None and last_hidden_state is not None and shared_kv is not None and cur_pos is not None:
             draft = self.assistant_drafter.draft(
                 last_token_id=tokens[-1],
@@ -198,7 +209,7 @@ class DSparkVerifier:
         temperature: float = 0.7,
     ) -> Tuple[List[int], int]:
         """
-        Verifies draft tokens against logits from target model.
+        Verify draft tokens against logits from target model.
         Returns accepted tokens and number of matches (for KV slicing).
         """
         selected = torch.argmax(logits, dim=-1).tolist()
@@ -217,5 +228,11 @@ class DSparkVerifier:
             bonus = selected[-1]
             accepted.append(bonus)
 
-        print(f"[SPEC DEBUG] draft={draft_tokens} selected={selected} n_matches={n_matches} accepted={accepted}", flush=True)
+        logger.debug(
+            "[SPEC DEBUG] draft=%s selected=%s n_matches=%d accepted=%s",
+            draft_tokens,
+            selected,
+            n_matches,
+            accepted,
+        )
         return accepted, n_matches

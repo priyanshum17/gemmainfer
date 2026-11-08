@@ -8,34 +8,51 @@ Measures:
 4. Roofline and memory bandwidth analysis
 """
 
+import argparse
 import os
 import sys
 import time
-import json
 import torch
-from transformers import AutoTokenizer
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from gemmainfer.models.config import GemmaConfig
+from gemmainfer.models.gemma import GemmaForCausalLM
 from gemmainfer.utils.weights import load_gemma_from_hf
 from gemmainfer.core.engine import GemmaInferEngine
 
 
-def profile_decode():
-    model_path = "/root/models/gemma-4-26B-A4B-it-W4A16"
+def profile_decode(args):
     print("=" * 80)
     print(" GEMMAINFER DETAILED DECODE PROFILER & FLAMEGRAPH ANALYZER")
     print("=" * 80)
-    print("Loading model and tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model, config = load_gemma_from_hf(model_path, device=torch.device("cuda"), dtype=torch.bfloat16)
-    engine = GemmaInferEngine(config=config, model=model, device="cuda", dtype=torch.bfloat16, enable_cuda_graphs=False)
+    device = torch.device(args.device)
+    dtype = torch.bfloat16
+
+    if args.synthetic or not (args.model_path and os.path.exists(args.model_path)):
+        if not args.synthetic and args.model_path:
+            print(f"[INFO] Model path '{args.model_path}' not found. Initializing synthetic Gemma 4 26B A4B.")
+        else:
+            print("[INFO] Initializing synthetic Gemma 4 26B A4B weights...")
+        config = GemmaConfig.gemma_4_26b_a4b()
+        config.quant_method = "w4a16"
+        model = GemmaForCausalLM(config).to(device=device, dtype=dtype)
+        tokenizer = None
+    else:
+        print(f"Loading model and tokenizer from {args.model_path}...")
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        model, config = load_gemma_from_hf(args.model_path, device=device, dtype=dtype)
+
+    engine = GemmaInferEngine(config=config, model=model, device=args.device, dtype=dtype, enable_cuda_graphs=False)
 
     prompt = "What is an operating system? Answer in one short sentence:"
-    messages = [{"role": "user", "content": prompt}]
-    prompt_str = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    input_ids = tokenizer.encode(prompt_str)
+    if tokenizer and hasattr(tokenizer, "apply_chat_template"):
+        messages = [{"role": "user", "content": prompt}]
+        prompt_str = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        input_ids = tokenizer.encode(prompt_str)
+    else:
+        input_ids = [ord(c) % 256000 for c in prompt]
 
     print("\nWarmup (generating 10 tokens)...")
     for _ in engine.generate_stream(input_ids, max_tokens=10, temperature=0.0):
@@ -68,9 +85,7 @@ def profile_decode():
         "total_step": [],
     }
 
-    # Hook into layer 0 to record per-layer micro timings
-    layer0 = model.layers[0]
-
+    # Profile per-layer execution
     for step in range(num_profile_steps):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -106,7 +121,7 @@ def profile_decode():
 
     # 2. PyTorch Profiler with Chrome Trace & Kernel Table
     print("\nCapturing PyTorch CUDA Profiler trace (with shapes & stacks)...")
-    trace_path = "/root/gemmainfer/decode_flamegraph.json"
+    trace_path = args.trace_path or os.environ.get("TRACE_PATH", "decode_flamegraph.json")
 
     with torch.profiler.profile(
         activities=[
@@ -125,7 +140,7 @@ def profile_decode():
 
     prof.export_chrome_trace(trace_path)
     print(f"Chrome trace exported to: {trace_path}")
-    print(f"(Can be visualized in https://ui.perfetto.dev or chrome://tracing)\n")
+    print("(Can be visualized in https://ui.perfetto.dev or chrome://tracing)\n")
 
     # Analyze Profiler key averages
     key_avgs = prof.key_averages()
@@ -222,13 +237,45 @@ def profile_decode():
     achieved_bw_gbs = (active_bytes_per_tok / measured_time_sec) / (1024**3)
 
     print("\nHARDWARE ROOFLINE & BOTTLENECK ANALYSIS (RTX 3090):")
-    print(f"  * Active Weights Read / Token : ~2.25 GB")
+    print("  * Active Weights Read / Token : ~2.25 GB")
     print(f"  * Average Token Time          : {avg_gpu_ms:.2f} ms")
     print(f"  * Achieved Memory Bandwidth   : {achieved_bw_gbs:.1f} GB/s")
-    print(f"  * RTX 3090 Peak Bandwidth     : ~936 GB/s (Practical sustained: ~750-800 GB/s)")
+    print("  * RTX 3090 Peak Bandwidth     : ~936 GB/s (Practical sustained: ~750-800 GB/s)")
     print(f"  * Memory Bus Efficiency       : {(achieved_bw_gbs / 750.0) * 100.0:.1f}% of real hardware maximum")
     print("=" * 80)
 
 
+def main():
+    parser = argparse.ArgumentParser(
+        description="GemmaInfer Detailed Decode Profiler & Flamegraph Analyzer",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=os.environ.get("GEMMA_MODEL_PATH", None),
+        help="Path to HuggingFace model weights directory",
+    )
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Profile using synthetic Gemma 4 26B A4B weights",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Target device (cuda, cpu, mps)",
+    )
+    parser.add_argument(
+        "--trace-path",
+        type=str,
+        default=None,
+        help="Output path for Chrome trace JSON (default: decode_flamegraph.json)",
+    )
+    args = parser.parse_args()
+    profile_decode(args)
+
+
 if __name__ == "__main__":
-    profile_decode()
+    main()

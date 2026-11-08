@@ -9,6 +9,8 @@ except ImportError:
 
 
 class GemmaRMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (RMSNorm) with optional unit offset and CUDA acceleration."""
+
     def __init__(self, dim: int, eps: float = 1e-6, add_unit_offset: bool = False, with_scale: bool = True):
         super().__init__()
         self.eps = eps
@@ -20,9 +22,11 @@ class GemmaRMSNorm(nn.Module):
             self.register_parameter("weight", None)
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        """Internal FP32 numerical root-mean-square normalization."""
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RMS normalization to tensor x."""
         if not self.with_scale or self.weight is None:
             return self._norm(x.float()).type_as(x)
 

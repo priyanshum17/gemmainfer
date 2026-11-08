@@ -3,6 +3,8 @@ import torch
 
 
 class CUDAGraphRunner:
+    """Manages CUDA graph capture and replay for deterministic single-token decode steps."""
+
     def __init__(
         self,
         model: torch.nn.Module,
@@ -18,6 +20,7 @@ class CUDAGraphRunner:
         self.is_cuda = (self.device.type == "cuda")
 
     def capture(self, max_seq_len: int = 4096):
+        """Warm up and record CUDA graphs for all supported batch sizes."""
         if not self.is_cuda:
             return
 
@@ -44,6 +47,7 @@ class CUDAGraphRunner:
             self.static_outputs[bs] = static_logits
 
     def replay(self, batch_size: int, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        """Replay recorded CUDA graph with current inputs, or fall back to standard forward."""
         if not self.is_cuda or batch_size not in self.graphs:
             logits, _ = self.model(input_ids, position_ids=position_ids)
             return logits

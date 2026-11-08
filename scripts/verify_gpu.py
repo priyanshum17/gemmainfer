@@ -8,13 +8,11 @@ Runs 5 validation stages:
 5. VRAM consumption and bandwidth sanity check
 """
 
-import sys
-import time
 import torch
 import torch.nn as nn
 
 try:
-    import gemmainfer_csrc
+    import gemmainfer_csrc  # noqa: F401
     HAS_CSRC = True
 except ImportError:
     HAS_CSRC = False
@@ -23,7 +21,7 @@ from gemmainfer.models.config import GemmaConfig
 from gemmainfer.models.gemma import GemmaForCausalLM
 from gemmainfer.kernels.norm import GemmaRMSNorm
 from gemmainfer.kernels.activations import apply_logit_softcapping
-from gemmainfer.kernels.quant import MarlinLinear, pack_to_marlin_w4a16
+from gemmainfer.kernels.quant import MarlinLinear
 
 
 def check_environment():
@@ -142,6 +140,7 @@ def verify_full_model_vram():
     print("=" * 65)
     torch.cuda.empty_cache()
     start_vram = torch.cuda.memory_allocated() / (1024**3)
+    print(f"Base Allocated VRAM: {start_vram:.2f} GB")
 
     config = GemmaConfig.gemma_test_small()
     config.quant_method = "w4a16"

@@ -4,6 +4,8 @@ from typing import Optional, Literal, List
 
 @dataclass
 class GemmaConfig:
+    """Architectural configuration parameters for Gemma models."""
+
     vocab_size: int = 262144
     hidden_size: int = 2816
     intermediate_size: int = 2112
@@ -44,18 +46,22 @@ class GemmaConfig:
             self.query_pre_attn_scalar = 1.0
 
     def is_full_attention(self, layer_idx: int) -> bool:
+        """Return True if the layer uses global full attention instead of sliding window."""
         return layer_idx in self.full_attention_layers
 
     @classmethod
     def gemma_4_26b_a4b(cls) -> "GemmaConfig":
+        """Default configuration for Google Gemma 4 26B A4B MoE."""
         return cls()
 
     @classmethod
     def gemma_26b_moe(cls) -> "GemmaConfig":
+        """Alias configuration for Gemma 26B MoE."""
         return cls()
 
     @classmethod
     def gemma_test_small(cls) -> "GemmaConfig":
+        """Scaled-down configuration for rapid unit tests."""
         return cls(
             vocab_size=1000,
             hidden_size=256,

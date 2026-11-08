@@ -17,6 +17,8 @@ except ImportError:
 
 
 class GemmaBatchedMoE(nn.Module):
+    """Batched Mixture of Experts module with router gating and optional Marlin W4A16 quantization."""
+
     def __init__(self, config: GemmaConfig):
         super().__init__()
         self.config = config
@@ -65,6 +67,7 @@ class GemmaBatchedMoE(nn.Module):
             nn.init.normal_(self.down_proj, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Route tokens to top-k experts and accumulate weighted outputs."""
         orig_shape = x.shape
         x_flat = x.view(-1, self.hidden_size)
         num_tokens = x_flat.shape[0]
@@ -161,6 +164,8 @@ class GemmaBatchedMoE(nn.Module):
 
 
 class GemmaDecoderLayer(nn.Module):
+    """Gemma transformer decoder layer with interleaved attention, shared MLP, and MoE blocks."""
+
     def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -195,6 +200,7 @@ class GemmaDecoderLayer(nn.Module):
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Execute decoder layer forward pass returning hidden states and updated KV cache."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, new_kv = self.self_attn(
@@ -227,6 +233,8 @@ class GemmaDecoderLayer(nn.Module):
 
 
 class GemmaForCausalLM(nn.Module):
+    """Gemma causal language model for autoregressive generation and speculative verification."""
+
     def __init__(self, config: GemmaConfig):
         super().__init__()
         self.config = config
@@ -240,6 +248,7 @@ class GemmaForCausalLM(nn.Module):
         self.lm_head.weight = self.embed_tokens.weight
 
     def init_kv_cache(self, batch_size: int = 1, max_seq_len: int = 4096, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
+        """Pre-allocate static key-value cache buffers across all decoder layers."""
         device = device or self.embed_tokens.weight.device
         dtype = dtype or self.embed_tokens.weight.dtype
         cache = []
@@ -259,6 +268,7 @@ class GemmaForCausalLM(nn.Module):
         return_logits_only_last: bool = True,
         return_hidden_states: bool = False,
     ):
+        """Execute model forward pass yielding logits and updated KV caches."""
         bsz, seq_len = input_ids.shape
 
         if position_ids is None:

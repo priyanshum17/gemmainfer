@@ -1,4 +1,3 @@
-import math
 from typing import Optional, Tuple
 import torch
 import torch.nn as nn
@@ -10,12 +9,15 @@ from gemmainfer.kernels.quant import MarlinLinear
 
 
 def _make_linear(in_features: int, out_features: int, bias: bool = False, quant_method: Optional[str] = None, group_size: int = 64) -> nn.Module:
+    """Helper to instantiate standard or Marlin quantized Linear layer."""
     if quant_method == "w4a16":
         return MarlinLinear(in_features, out_features, group_size=group_size, bias=bias)
     return nn.Linear(in_features, out_features, bias=bias)
 
 
 class GemmaRotaryEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE) supporting full and partial rotary dimensions."""
+
     def __init__(self, dim: int, max_position_embeddings: int = 262144, base: float = 10000.0, partial_rotary_factor: float = 1.0):
         super().__init__()
         self.dim = dim
@@ -35,6 +37,7 @@ class GemmaRotaryEmbedding(nn.Module):
         self._set_cos_sin_cache(seq_len=min(max_position_embeddings, 8192))
 
     def _set_cos_sin_cache(self, seq_len: int, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
+        """Compute and cache cosine and sine frequencies for positional encodings."""
         device = device or self.inv_freq.device
         dtype = dtype or torch.get_default_dtype()
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
@@ -44,6 +47,7 @@ class GemmaRotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
     def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Retrieve cached cosine and sine values for input tensor."""
         if self.cos_cached.device != x.device or self.cos_cached.dtype != x.dtype:
             self.cos_cached = self.cos_cached.to(device=x.device, dtype=x.dtype)
             self.sin_cached = self.sin_cached.to(device=x.device, dtype=x.dtype)
@@ -55,12 +59,14 @@ class GemmaRotaryEmbedding(nn.Module):
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate half the hidden dimensions of tensor for rotary position embedding."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary position embeddings to query and key states."""
     cos = cos[position_ids].unsqueeze(1)
     sin = sin[position_ids].unsqueeze(1)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -69,6 +75,8 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, si
 
 
 class GemmaAttention(nn.Module):
+    """Multi-head attention supporting sliding window attention, global attention, and GQA."""
+
     def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -122,6 +130,7 @@ class GemmaAttention(nn.Module):
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Compute self-attention output states and updated KV cache."""
         bsz, q_len, _ = hidden_states.size()
 
         q = self.q_proj(hidden_states)

@@ -1,4 +1,4 @@
-import time
+import logging
 import uuid
 from typing import List, Optional, Any
 import torch
@@ -10,8 +10,12 @@ from gemmainfer.core.scheduler import AsyncScheduler, Sequence
 from gemmainfer.core.cuda_graph import CUDAGraphRunner
 from gemmainfer.speculative.dspark import DSparkVerifier
 
+logger = logging.getLogger("gemmainfer")
+
 
 class GemmaInferEngine:
+    """High-performance inference engine for Gemma models supporting speculative decoding."""
+
     def __init__(
         self,
         config: Optional[GemmaConfig] = None,
@@ -24,6 +28,7 @@ class GemmaInferEngine:
         enable_dspark: bool = True,
         dtype: torch.dtype = torch.bfloat16,
     ):
+        """Initialize the GemmaInfer engine with model, memory manager, and schedulers."""
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -70,6 +75,7 @@ class GemmaInferEngine:
         top_p: float = 0.95,
         req_id: Optional[str] = None,
     ):
+        """Generate tokens in a streaming fashion using autoregressive or speculative decode."""
         req_id = req_id or str(uuid.uuid4())
         seq = Sequence(
             seq_id=req_id,
@@ -172,6 +178,13 @@ class GemmaInferEngine:
                             for k, v in past_kv
                         ]
 
+                    logger.debug(
+                        "[CYCLE] draft=%s matches=%d accepted=%s",
+                        draft,
+                        n_matches,
+                        accepted,
+                    )
+
                     for tok in accepted:
                         seq.append_token(tok)
                         yield tok
@@ -214,6 +227,7 @@ class GemmaInferEngine:
         top_p: float = 0.95,
         req_id: Optional[str] = None,
     ) -> List[int]:
+        """Generate output tokens synchronously for a given prompt token sequence."""
         return list(
             self.generate_stream(
                 prompt_token_ids=prompt_token_ids,

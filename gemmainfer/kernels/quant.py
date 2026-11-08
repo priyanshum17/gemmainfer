@@ -1,4 +1,4 @@
-from typing import Tuple, Optional
+from typing import Tuple
 import torch
 import torch.nn as nn
 
@@ -13,6 +13,7 @@ def pack_to_marlin_w4a16(
     weight: torch.Tensor,
     group_size: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize FP16/BF16 weights to 4-bit Marlin format with per-group scales."""
     w = weight.t().contiguous()
     K, N = w.shape
     assert K % group_size == 0
@@ -44,6 +45,7 @@ def marlin_forward(
     group_size: int,
     out_features: int,
 ) -> torch.Tensor:
+    """Execute Marlin W4A16 GEMM with CUDA kernel acceleration or CPU fallback."""
     M = x_2d.size(0)
     out = torch.empty((M, out_features), dtype=x_2d.dtype, device=x_2d.device)
     if _HAS_CSRC and x_2d.is_cuda:
@@ -67,6 +69,8 @@ def marlin_forward(
 
 
 class MarlinLinear(nn.Module):
+    """Linear layer using 4-bit weight quantization and 16-bit activations (W4A16)."""
+
     def __init__(
         self,
         in_features: int,
@@ -96,6 +100,7 @@ class MarlinLinear(nn.Module):
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, group_size: int = 128) -> "MarlinLinear":
+        """Construct a quantized MarlinLinear layer from an existing nn.Linear module."""
         marlin = cls(
             in_features=linear.in_features,
             out_features=linear.out_features,
@@ -111,6 +116,7 @@ class MarlinLinear(nn.Module):
         return marlin
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Perform quantized GEMM for input activations x."""
         orig_shape = x.shape
         x_2d = x.view(-1, self.in_features).contiguous()
         out = marlin_forward(x_2d, self.packed_weight, self.scales, self.group_size, self.out_features)

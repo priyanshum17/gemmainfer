@@ -4,7 +4,6 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-template <typename T>
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {

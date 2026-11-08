@@ -8,6 +8,8 @@ from gemmainfer.core.block_manager import BlockManager
 
 @dataclass
 class Sequence:
+    """Represents an active generation request with prompt, output tokens, and sampling configuration."""
+
     seq_id: str
     prompt_token_ids: List[int]
     output_token_ids: List[int] = field(default_factory=list)
@@ -18,9 +20,11 @@ class Sequence:
 
     @property
     def total_len(self) -> int:
+        """Return total sequence length including prompt and generated tokens."""
         return len(self.prompt_token_ids) + len(self.output_token_ids)
 
     def append_token(self, token_id: int):
+        """Append newly sampled token and update finish state if max_tokens is reached."""
         self.output_token_ids.append(token_id)
         if len(self.output_token_ids) >= self.max_tokens:
             self.is_finished = True
@@ -28,6 +32,8 @@ class Sequence:
 
 @dataclass
 class BatchDescriptor:
+    """Metadata describing a scheduled batch of sequences for prefill or decode execution."""
+
     seqs: List[Sequence]
     input_ids: torch.Tensor
     position_ids: torch.Tensor
@@ -35,6 +41,8 @@ class BatchDescriptor:
 
 
 class AsyncScheduler:
+    """Asynchronous request scheduler managing continuous batching for prefill and decode phases."""
+
     def __init__(self, block_manager: BlockManager, device: torch.device):
         self.block_manager = block_manager
         self.device = device
@@ -43,9 +51,11 @@ class AsyncScheduler:
         self.h2d_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
 
     def add_request(self, seq: Sequence):
+        """Enqueue an incoming sequence into the waiting queue."""
         self.waiting_queue.append(seq)
 
     def schedule_next_batch(self, max_batch_size: int = 8) -> Optional[BatchDescriptor]:
+        """Schedule the next batch for execution, prioritizing running decodes before prefills."""
         finished = [s for s in self.running_batch if s.is_finished]
         for s in finished:
             self.block_manager.free_sequence(s.seq_id)

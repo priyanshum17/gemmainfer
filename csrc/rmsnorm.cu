@@ -4,7 +4,6 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-template <typename T>
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
@@ -39,7 +38,7 @@ __global__ void gemma_rmsnorm_kernel(
         thread_sq_sum += val * val;
     }
 
-    float warp_sum = warp_reduce_sum<float>(thread_sq_sum);
+    float warp_sum = warp_reduce_sum(thread_sq_sum);
     if (lane == 0) {
         s_warp_sums[warp_id] = warp_sum;
     }
@@ -48,7 +47,7 @@ __global__ void gemma_rmsnorm_kernel(
     float block_sq_sum = 0.0f;
     if (warp_id == 0) {
         float val = (tid < num_warps) ? s_warp_sums[tid] : 0.0f;
-        block_sq_sum = warp_reduce_sum<float>(val);
+        block_sq_sum = warp_reduce_sum(val);
         if (lane == 0) {
             s_warp_sums[0] = block_sq_sum;
         }

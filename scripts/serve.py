@@ -17,7 +17,7 @@ import os
 import sys
 import time
 import uuid
-from typing import List, Optional, Union, Dict, Any
+from typing import List, Optional, Union
 
 import torch
 
@@ -29,9 +29,9 @@ from gemmainfer.core.engine import GemmaInferEngine
 from gemmainfer.utils.weights import load_gemma_from_hf
 
 try:
-    from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import StreamingResponse, JSONResponse
-    from pydantic import BaseModel, Field
+    from fastapi import FastAPI
+    from fastapi.responses import StreamingResponse
+    from pydantic import BaseModel
     import uvicorn
     HAS_FASTAPI = True
 except ImportError:
@@ -188,18 +188,111 @@ def create_app(engine: GemmaInferEngine, model_name: str = "gemma-4-26b-a4b", to
             },
         }
 
+    @app.post("/v1/completions")
+    async def completions(req: CompletionRequest):
+        if isinstance(req.prompt, str):
+            if tokenizer is not None:
+                prompt_ids = tokenizer.encode(req.prompt)
+            else:
+                prompt_ids = [ord(c) % 256000 for c in req.prompt]
+        else:
+            prompt_ids = list(req.prompt)
+
+        if not prompt_ids:
+            prompt_ids = [1]
+
+        req_id = f"cmpl-{uuid.uuid4().hex[:12]}"
+        created_ts = int(time.time())
+
+        if req.stream:
+            async def event_generator():
+                for tok in engine.generate_stream(
+                    prompt_token_ids=prompt_ids,
+                    max_tokens=req.max_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                ):
+                    chunk = {
+                        "id": req_id,
+                        "object": "text_completion",
+                        "created": created_ts,
+                        "model": req.model,
+                        "choices": [
+                            {
+                                "text": decode_token(tok),
+                                "index": 0,
+                                "logprobs": None,
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+                final_chunk = {
+                    "id": req_id,
+                    "object": "text_completion",
+                    "created": created_ts,
+                    "model": req.model,
+                    "choices": [
+                        {
+                            "text": "",
+                            "index": 0,
+                            "logprobs": None,
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(final_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+        tokens = engine.generate(
+            prompt_token_ids=prompt_ids,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+        )
+        text = "".join([decode_token(t) for t in tokens])
+
+        return {
+            "id": req_id,
+            "object": "text_completion",
+            "created": created_ts,
+            "model": req.model,
+            "choices": [
+                {
+                    "text": text,
+                    "index": 0,
+                    "logprobs": None,
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(prompt_ids),
+                "completion_tokens": len(tokens),
+                "total_tokens": len(prompt_ids) + len(tokens),
+            },
+        }
+
     return app
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GemmaInfer Serving Server")
-    parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-path", type=str, default=None)
-    parser.add_argument("--assistant-model-path", type=str, default=None)
-    parser.add_argument("--synthetic", action="store_true")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser = argparse.ArgumentParser(
+        description="GemmaInfer High-Performance OpenAI-Compatible HTTP Serving Server",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host interface to bind server")
+    parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
+    parser.add_argument("--model-path", type=str, default=None, help="Path to Gemma HuggingFace checkpoint directory")
+    parser.add_argument("--model-name", type=str, default=None, help="Model identifier name reported in /v1/models")
+    parser.add_argument("--assistant-model-path", type=str, default=None, help="Path to companion draft assistant model")
+    parser.add_argument("--synthetic", action="store_true", help="Initialize synthetic Gemma 4 26B A4B weights")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device")
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"], help="Weights and activation data type")
+    parser.add_argument("--no-cuda-graphs", action="store_true", help="Disable CUDA Graph acceleration for decoding")
+    parser.add_argument("--no-dspark", action="store_true", help="Disable DSpark speculative decoding")
     args = parser.parse_args()
 
     if not HAS_FASTAPI:
@@ -208,6 +301,13 @@ def main():
 
     dtype = getattr(torch, args.dtype)
     assistant_model = None
+
+    model_name = args.model_name
+    if model_name is None:
+        if args.model_path:
+            model_name = os.path.basename(os.path.normpath(args.model_path))
+        else:
+            model_name = "gemma-4-26b-a4b"
 
     if args.model_path and not args.synthetic:
         print(f"Loading weights from {args.model_path}...")
@@ -243,11 +343,11 @@ def main():
         assistant_model=assistant_model,
         device=args.device,
         dtype=dtype,
-        enable_cuda_graphs=False,
-        enable_dspark=True,
+        enable_cuda_graphs=not args.no_cuda_graphs if args.device == "cuda" else False,
+        enable_dspark=not args.no_dspark,
     )
 
-    app = create_app(engine, tokenizer=tokenizer)
+    app = create_app(engine, model_name=model_name, tokenizer=tokenizer)
     print(f"\nGemmaInfer Server listening on http://{args.host}:{args.port}")
     print(f"OpenAI Chat API: http://{args.host}:{args.port}/v1/chat/completions\n")
     uvicorn.run(app, host=args.host, port=args.port)

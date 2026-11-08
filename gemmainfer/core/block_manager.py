@@ -2,16 +2,21 @@ from typing import List, Dict, Tuple
 
 
 class Block:
+    """Represents a discrete memory block in the paged KV cache pool."""
+
     def __init__(self, block_id: int, block_size: int):
         self.block_id = block_id
         self.block_size = block_size
         self.ref_count = 0
 
     def reset(self):
+        """Reset the reference count for the block."""
         self.ref_count = 0
 
 
 class BlockManager:
+    """Manages paged KV cache allocation with separate pools for global and sliding window layers."""
+
     def __init__(
         self,
         num_blocks: int,
@@ -30,13 +35,16 @@ class BlockManager:
         self.req_to_swa_blocks: Dict[str, List[int]] = {}
 
     def get_num_free_blocks(self) -> int:
+        """Return the count of available unallocated blocks."""
         return len(self.free_blocks)
 
     def can_allocate(self, num_tokens: int) -> bool:
+        """Check whether sufficient free blocks exist to allocate tokens."""
         num_required = (num_tokens + self.block_size - 1) // self.block_size
         return len(self.free_blocks) >= num_required
 
     def allocate_sequence(self, req_id: str, num_tokens: int) -> Tuple[List[int], List[int]]:
+        """Allocate physical KV blocks for full attention and sliding-window attention."""
         num_blocks_needed = (num_tokens + self.block_size - 1) // self.block_size
         if len(self.free_blocks) < num_blocks_needed:
             raise MemoryError(f"Insufficient KV blocks: requested {num_blocks_needed}, free {len(self.free_blocks)}")
@@ -55,6 +63,7 @@ class BlockManager:
         return global_blocks, swa_blocks
 
     def append_token(self, req_id: str, cur_seq_len: int) -> Tuple[bool, bool]:
+        """Grow sequence allocation on block boundary if needed."""
         allocated_global = False
         allocated_swa = False
 
@@ -77,6 +86,7 @@ class BlockManager:
         return allocated_global, allocated_swa
 
     def free_sequence(self, req_id: str):
+        """Release all allocated physical blocks for sequence back to the free pool."""
         if req_id in self.req_to_global_blocks:
             for b_id in self.req_to_global_blocks[req_id]:
                 self.blocks[b_id].ref_count -= 1

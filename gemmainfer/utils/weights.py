@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Dict, Any, Optional, Tuple
+from typing import Tuple
 import torch
 from safetensors import safe_open
 
@@ -13,6 +13,7 @@ def load_gemma_from_hf(
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
 ) -> Tuple[GemmaForCausalLM, GemmaConfig]:
+    """Load Gemma weights and architecture configuration from Hugging Face safetensors directory."""
     config_file = os.path.join(model_path, "config.json")
     if not os.path.exists(config_file):
         raise FileNotFoundError(f"Missing config.json in {model_path}")
