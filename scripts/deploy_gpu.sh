@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# GemmaInfer Turnkey GPU Deployment Script (NVIDIA RTX 3090 / 4090 / Cloud GPUs)
+# ==============================================================================
+# Sets up Python 3.12, installs CUDA PyTorch with uv, compiles native CUDA kernels
+# with Ninja for sm_86/sm_89, verifies hardware correctness, and launches the engine.
+#
+# Usage:
+#   bash scripts/deploy_gpu.sh          # Interactive deployment
+#   bash scripts/deploy_gpu.sh verify   # Run 5-stage verification only
+#   bash scripts/deploy_gpu.sh chat     # Launch interactive CLI chat
+#   bash scripts/deploy_gpu.sh serve    # Launch OpenAI-compatible HTTP server
+# ==============================================================================
+
+set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+echo "=================================================================="
+echo " GemmaInfer Turnkey GPU Deployment (RTX 3090 / 4090 / 24GB VRAM) "
+echo "=================================================================="
+
+# 1. Check NVIDIA Driver & GPU
+if ! command -v nvidia-smi &> /dev/null; then
+    echo "[ERROR] nvidia-smi not found. Ensure NVIDIA GPU and drivers are installed."
+    exit 1
+fi
+
+echo -n "Checking NVIDIA Hardware: "
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
+GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)
+DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n 1)
+echo "${GPU_NAME} (${GPU_VRAM} MiB VRAM, Driver ${DRIVER_VER})"
+
+# 2. Install uv package manager if missing
+if ! command -v uv &> /dev/null; then
+    echo "[INFO] Installing uv package manager..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:${PATH}"
+fi
+
+# 3. Setup Virtual Environment (Python 3.12)
+VENV_DIR="${REPO_ROOT}/.venv"
+if [ ! -d "${VENV_DIR}" ]; then
+    echo "[INFO] Creating Python 3.12 virtual environment at ${VENV_DIR}..."
+    uv venv "${VENV_DIR}" --python 3.12
+fi
+source "${VENV_DIR}/bin/activate"
+
+# 4. Install Dependencies (Ninja + PyTorch CUDA 12.1 + Requirements)
+echo "[INFO] Installing PyTorch with CUDA 12.1 support and build dependencies..."
+uv pip install ninja
+uv pip install "torch==2.5.1" --extra-index-url https://download.pytorch.org/whl/cu121
+uv pip install --no-build-isolation -e ".[dev,serve]"
+
+# 5. Compile C++/CUDA Kernels
+echo "[INFO] Compiling native CUDA kernels with Ninja (Ampere sm_86 & Ada sm_89)..."
+export FORCE_CUDA=1
+export TORCH_CUDA_ARCH_LIST="8.6;8.9"
+python setup.py build_ext --inplace
+
+# Verify compiled library exists
+if ! ls gemmainfer_csrc*.so 1> /dev/null 2>&1; then
+    echo "[ERROR] CUDA kernel compilation failed. Check compiler logs above."
+    exit 1
+fi
+echo "[PASS] Native CUDA kernels compiled successfully (gemmainfer_csrc*.so)."
+
+# 6. Run Hardware Verification Suite
+echo ""
+echo "[INFO] Running 5-stage GPU hardware & numerical verification..."
+python scripts/verify_gpu.py
+
+# 7. Action Selection
+ACTION="${1:-prompt}"
+
+if [ "${ACTION}" = "verify" ]; then
+    echo "[INFO] Verification complete. Exiting."
+    exit 0
+elif [ "${ACTION}" = "chat" ]; then
+    echo "[INFO] Launching interactive generation CLI..."
+    python scripts/chat.py --synthetic --device cuda
+elif [ "${ACTION}" = "serve" ]; then
+    echo "[INFO] Launching OpenAI-compatible HTTP server..."
+    python scripts/serve.py --synthetic --device cuda --host 0.0.0.0 --port 8000
+elif [ "${ACTION}" = "prompt" ]; then
+    echo ""
+    echo "=================================================================="
+    echo " GemmaInfer is fully deployed on your GPU!"
+    echo " Select an option to start:"
+    echo "   1) Interactive CLI Chat (Terminal generation with token streaming)"
+    echo "   2) OpenAI-Compatible HTTP Server (Port 8000 for OpenWebUI / curl)"
+    echo "   3) Latency & Throughput Benchmark Suite"
+    echo "   4) Exit"
+    echo "=================================================================="
+    read -r -p "Enter choice [1-4]: " CHOICE
+    case "${CHOICE}" in
+        1)
+            python scripts/chat.py --synthetic --device cuda
+            ;;
+        2)
+            python scripts/serve.py --synthetic --device cuda --host 0.0.0.0 --port 8000
+            ;;
+        3)
+            python benchmarks/benchmark_latency.py
+            python benchmarks/benchmark_marlin_gemma.py
+            ;;
+        *)
+            echo "Exiting. You can launch anytime with: source .venv/bin/activate && python scripts/chat.py"
+            ;;
+    esac
+fi

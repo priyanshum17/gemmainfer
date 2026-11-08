@@ -49,7 +49,19 @@ pip install -e .
 python setup.py build_ext --inplace
 ```
 
-### Run Generation
+### 1-Click GPU Deployment (RTX 3090 / 4090 / 24GB VRAM)
+
+```bash
+# Automated environment setup, CUDA kernel build, verification & launcher
+bash scripts/deploy_gpu.sh
+
+# Or launch specific modes directly
+bash scripts/deploy_gpu.sh chat    # Terminal generation with streaming tokens
+bash scripts/deploy_gpu.sh serve   # OpenAI-compatible API server on port 8000
+bash scripts/deploy_gpu.sh verify  # Run 5-stage numerical & VRAM verification
+```
+
+### Python API Usage
 ```python
 import torch
 from gemmainfer.models.config import GemmaConfig

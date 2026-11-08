@@ -56,14 +56,14 @@ class GemmaInferEngine:
             self.graph_runner.capture()
 
     @torch.inference_mode()
-    def generate(
+    def generate_stream(
         self,
         prompt_token_ids: List[int],
         max_tokens: int = 64,
         temperature: float = 0.7,
         top_p: float = 0.95,
         req_id: Optional[str] = None,
-    ) -> List[int]:
+    ):
         req_id = req_id or str(uuid.uuid4())
         seq = Sequence(
             seq_id=req_id,
@@ -74,10 +74,10 @@ class GemmaInferEngine:
         )
 
         input_ids = torch.tensor(prompt_token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
-        
         logits, past_kv = self.model(input_ids, return_logits_only_last=True)
         next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
         seq.append_token(next_token)
+        yield next_token
 
         while not seq.is_finished:
             tokens_so_far = seq.prompt_token_ids + seq.output_token_ids
@@ -106,6 +106,7 @@ class GemmaInferEngine:
 
                     for tok in accepted:
                         seq.append_token(tok)
+                        yield tok
                         if seq.is_finished:
                             break
                     continue
@@ -118,5 +119,23 @@ class GemmaInferEngine:
             )
             next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
             seq.append_token(next_token)
+            yield next_token
 
-        return seq.output_token_ids
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt_token_ids: List[int],
+        max_tokens: int = 64,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        req_id: Optional[str] = None,
+    ) -> List[int]:
+        return list(
+            self.generate_stream(
+                prompt_token_ids=prompt_token_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                req_id=req_id,
+            )
+        )
