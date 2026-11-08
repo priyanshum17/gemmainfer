@@ -217,6 +217,18 @@ class GemmaForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight
 
+    def init_kv_cache(self, batch_size: int = 1, max_seq_len: int = 4096, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
+        device = device or self.embed_tokens.weight.device
+        dtype = dtype or self.embed_tokens.weight.dtype
+        cache = []
+        for layer in self.layers:
+            attn = layer.self_attn
+            k_buf = torch.zeros((batch_size, attn.num_key_value_heads, max_seq_len, attn.head_dim), device=device, dtype=dtype)
+            v_buf = torch.zeros((batch_size, attn.num_key_value_heads, max_seq_len, attn.head_dim), device=device, dtype=dtype)
+            cur_len = [0]
+            cache.append((k_buf, v_buf, cur_len))
+        return cache
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -230,7 +242,10 @@ class GemmaForCausalLM(nn.Module):
             if past_key_values is None or past_key_values[0] is None:
                 position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(bsz, -1)
             else:
-                past_len = past_key_values[0][0].shape[2]
+                if isinstance(past_key_values[0], tuple) and len(past_key_values[0]) == 3:
+                    past_len = past_key_values[0][2][0]
+                else:
+                    past_len = past_key_values[0][0].shape[2]
                 position_ids = torch.arange(past_len, past_len + seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(bsz, -1)
 
         hidden_states = (self.embed_tokens(input_ids) * (self.config.hidden_size ** 0.5)).to(dtype=self.embed_tokens.weight.dtype)

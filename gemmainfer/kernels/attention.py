@@ -140,10 +140,22 @@ class GemmaAttention(nn.Module):
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
         if kv_cache is not None:
-            k_prev, v_prev = kv_cache
-            k = torch.cat([k_prev, k], dim=2)
-            v = torch.cat([v_prev, v], dim=2)
-        new_kv_cache = (k, v)
+            if isinstance(kv_cache, tuple) and len(kv_cache) == 3:
+                k_buf, v_buf, cur_len = kv_cache
+                pos = cur_len[0]
+                k_buf[:, :, pos : pos + q_len, :].copy_(k)
+                v_buf[:, :, pos : pos + q_len, :].copy_(v)
+                cur_len[0] += q_len
+                k = k_buf[:, :, : cur_len[0], :]
+                v = v_buf[:, :, : cur_len[0], :]
+                new_kv_cache = (k_buf, v_buf, cur_len)
+            else:
+                k_prev, v_prev = kv_cache
+                k = torch.cat([k_prev, k], dim=2)
+                v = torch.cat([v_prev, v], dim=2)
+                new_kv_cache = (k, v)
+        else:
+            new_kv_cache = (k, v)
 
         if self.num_key_value_groups > 1:
             k_expanded = k.repeat_interleave(self.num_key_value_groups, dim=1)

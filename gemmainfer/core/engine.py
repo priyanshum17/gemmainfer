@@ -74,10 +74,17 @@ class GemmaInferEngine:
         )
 
         input_ids = torch.tensor(prompt_token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
-        logits, past_kv = self.model(input_ids, return_logits_only_last=True)
+        past_kv = self.model.init_kv_cache(batch_size=1, max_seq_len=min(self.config.max_position_embeddings, 4096), device=self.device, dtype=self.dtype)
+        logits, past_kv = self.model(input_ids, past_key_values=past_kv, return_logits_only_last=True)
         next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
         seq.append_token(next_token)
         yield next_token
+
+        eos_tokens = (1, 106)
+        if next_token in eos_tokens:
+            return
+
+        curr_token_tensor = torch.zeros((1, 1), dtype=torch.long, device=self.device)
 
         while not seq.is_finished:
             tokens_so_far = seq.prompt_token_ids + seq.output_token_ids
@@ -85,7 +92,7 @@ class GemmaInferEngine:
             if self.dspark is not None:
                 draft = self.dspark.propose_draft(tokens_so_far)
                 if draft:
-                    orig_kv_len = past_kv[0][0].shape[2]
+                    orig_kv_len = past_kv[0][2][0] if isinstance(past_kv[0], tuple) and len(past_kv[0]) == 3 else past_kv[0][0].shape[2]
                     draft_tensor = torch.tensor(draft, dtype=torch.long, device=self.device).unsqueeze(0)
                     all_logits, past_kv = self.model(
                         draft_tensor,
@@ -98,20 +105,24 @@ class GemmaInferEngine:
                         temperature=temperature,
                     )
 
-                    retained_len = min(orig_kv_len + count, past_kv[0][0].shape[2])
-                    past_kv = [
-                        (k[:, :, :retained_len, :], v[:, :, :retained_len, :])
-                        for k, v in past_kv
-                    ]
+                    retained_len = orig_kv_len + count
+                    if isinstance(past_kv[0], tuple) and len(past_kv[0]) == 3:
+                        for layer_kv in past_kv:
+                            layer_kv[2][0] = retained_len
+                    else:
+                        past_kv = [
+                            (k[:, :, :retained_len, :], v[:, :, :retained_len, :])
+                            for k, v in past_kv
+                        ]
 
                     for tok in accepted:
                         seq.append_token(tok)
                         yield tok
-                        if seq.is_finished:
-                            break
+                        if tok in eos_tokens or seq.is_finished:
+                            return
                     continue
 
-            curr_token_tensor = torch.tensor([[seq.output_token_ids[-1]]], dtype=torch.long, device=self.device)
+            curr_token_tensor[0, 0] = seq.output_token_ids[-1]
             logits, past_kv = self.model(
                 curr_token_tensor,
                 past_key_values=past_kv,
@@ -120,6 +131,8 @@ class GemmaInferEngine:
             next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
             seq.append_token(next_token)
             yield next_token
+            if next_token in eos_tokens:
+                break
 
     @torch.inference_mode()
     def generate(
