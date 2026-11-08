@@ -129,9 +129,21 @@ def profile_decode():
 
     # Analyze Profiler key averages
     key_avgs = prof.key_averages()
-    cuda_sorted = sorted(key_avgs, key=lambda x: x.self_cuda_time_total, reverse=True)
+    
+    def get_device_time(item):
+        for attr in ("self_device_time_total", "self_cuda_time_total", "device_time_total", "cuda_time_total"):
+            if hasattr(item, attr):
+                return getattr(item, attr)
+        return 0
 
-    total_cuda_time = sum(k.self_cuda_time_total for k in cuda_sorted)
+    cuda_sorted = sorted(key_avgs, key=get_device_time, reverse=True)
+    total_cuda_time = sum(get_device_time(k) for k in cuda_sorted)
+
+    print("=" * 80)
+    print(" PYTORCH OFFICIAL PROFILER SUMMARY TABLE (Sorted by Device Time)")
+    print("=" * 80)
+    sort_key = "self_device_time_total" if hasattr(key_avgs[0], "self_device_time_total") else "self_cuda_time_total"
+    print(key_avgs.table(sort_by=sort_key, row_limit=20))
 
     print("=" * 80)
     print(" TOP 15 CUDA KERNELS BY GPU TIME (Decode Step)")
@@ -149,15 +161,16 @@ def profile_decode():
     other_time = 0
 
     for item in cuda_sorted[:15]:
-        total_ms = item.self_cuda_time_total / 1000.0
-        pct = (item.self_cuda_time_total / total_cuda_time * 100.0) if total_cuda_time > 0 else 0
-        avg_us = (item.self_cuda_time_total / item.count) if item.count > 0 else 0
+        d_time = get_device_time(item)
+        total_ms = d_time / 1000.0
+        pct = (d_time / total_cuda_time * 100.0) if total_cuda_time > 0 else 0
+        avg_us = (d_time / item.count) if item.count > 0 else 0
         name = item.key[:40]
         print(f"{name:<42} | {item.count:<6} | {total_ms:<14.2f} | {pct:<7.1f}% | {avg_us:<10.1f}")
 
     for item in cuda_sorted:
         key = item.key.lower()
-        t = item.self_cuda_time_total
+        t = get_device_time(item)
         if "fused_moe_gate_up" in key:
             moe_gu_time += t
         elif "fused_moe_down" in key:
