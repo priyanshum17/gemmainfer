@@ -65,6 +65,11 @@ def create_app(engine: GemmaInferEngine, model_name: str = "gemma-4-26b-a4b", to
         stream: Optional[bool] = False
 
     def tokenize_messages(messages: List[ChatMessage]) -> List[int]:
+        if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+            msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
+            prompt_str = tokenizer.apply_chat_template(msg_dicts, tokenize=False, add_generation_prompt=True)
+            return tokenizer.encode(prompt_str)
+
         prompt_text = ""
         for m in messages:
             prompt_text += f"<start_of_turn>{m.role}\n{m.content}<end_of_turn>\n"
