@@ -45,14 +45,26 @@ class GemmaBatchedMoE(nn.Module):
         weights = weights * scales
 
         out = torch.zeros_like(x_flat)
-        
+        is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+        if num_tokens <= 64 or is_capturing:
+            for k in range(self.top_k):
+                e_idx = indices[:, k]
+                w = weights[:, k : k + 1]
+                w_gu = self.gate_up_proj[e_idx]
+                gu = torch.bmm(x_flat.unsqueeze(1), w_gu).squeeze(1)
+                gate, up = gu.chunk(2, dim=-1)
+                act = F.gelu(gate, approximate="tanh") * up
+                w_d = self.down_proj[e_idx]
+                expert_out = torch.bmm(act.unsqueeze(1), w_d).squeeze(1)
+                out = out + expert_out * w
+            return out.view(orig_shape)
+
         flat_indices = indices.view(-1)
-        unique_experts, inverse_map = torch.unique(flat_indices, return_inverse=True)
-        
         token_indices = torch.arange(num_tokens, device=x.device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)
         weights_flat = weights.view(-1, 1)
 
-        for e_idx in unique_experts:
+        for e_idx in range(self.num_experts):
             mask = (flat_indices == e_idx)
             if not mask.any():
                 continue
