@@ -190,9 +190,11 @@ class GemmaAttention(nn.Module):
         if mask is not None:
             attn_weights = attn_weights + mask
         elif q_len > 1:
-            causal_mask = torch.triu(torch.full((q_len, total_k_len), float("-inf"), device=q.device), diagonal=1)
+            causal_diag = total_k_len - q_len + 1
+            causal_mask = torch.triu(torch.full((q_len, total_k_len), float("-inf"), device=q.device), diagonal=causal_diag)
             if self.sliding_window is not None:
-                window_mask = torch.tril(torch.full((q_len, total_k_len), float("-inf"), device=q.device), diagonal=-self.sliding_window)
+                window_diag = total_k_len - q_len - self.sliding_window
+                window_mask = torch.tril(torch.full((q_len, total_k_len), float("-inf"), device=q.device), diagonal=window_diag)
                 causal_mask = causal_mask + window_mask
             attn_weights = attn_weights + causal_mask.unsqueeze(0).unsqueeze(0)
 

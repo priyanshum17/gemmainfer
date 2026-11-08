@@ -255,7 +255,8 @@ class GemmaForCausalLM(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         return_logits_only_last: bool = True,
-    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        return_hidden_states: bool = False,
+    ):
         bsz, seq_len = input_ids.shape
 
         if position_ids is None:
@@ -282,6 +283,8 @@ class GemmaForCausalLM(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
+        last_hidden = hidden_states[:, -1:, :] if return_logits_only_last else hidden_states
+
         if return_logits_only_last:
             hidden_states = hidden_states[:, -1:, :]
 
@@ -290,4 +293,6 @@ class GemmaForCausalLM(nn.Module):
         if self.config.final_logit_softcapping is not None:
             logits = apply_logit_softcapping(logits, self.config.final_logit_softcapping)
 
+        if return_hidden_states:
+            return logits, new_past_key_values, last_hidden
         return logits, new_past_key_values

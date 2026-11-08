@@ -196,6 +196,7 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-path", type=str, default=None)
+    parser.add_argument("--assistant-model-path", type=str, default=None)
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
@@ -206,6 +207,7 @@ def main():
         sys.exit(1)
 
     dtype = getattr(torch, args.dtype)
+    assistant_model = None
 
     if args.model_path and not args.synthetic:
         print(f"Loading weights from {args.model_path}...")
@@ -215,6 +217,19 @@ def main():
             tokenizer = AutoTokenizer.from_pretrained(args.model_path)
         except Exception:
             tokenizer = None
+
+        if args.assistant_model_path and os.path.exists(args.assistant_model_path):
+            try:
+                from transformers import AutoModelForCausalLM
+                print(f"Loading assistant model from {args.assistant_model_path}...")
+                assistant_model = AutoModelForCausalLM.from_pretrained(
+                    args.assistant_model_path,
+                    dtype=dtype,
+                    device_map=args.device,
+                )
+                print(f"Loaded assistant model successfully: {type(assistant_model)}")
+            except Exception as e:
+                print(f"[WARNING] Failed to load assistant model: {e}")
     else:
         print("Initializing synthetic Gemma 4 26B A4B model...")
         config = GemmaConfig.gemma_4_26b_a4b()
@@ -225,6 +240,7 @@ def main():
     engine = GemmaInferEngine(
         config=config,
         model=model,
+        assistant_model=assistant_model,
         device=args.device,
         dtype=dtype,
         enable_cuda_graphs=False,
