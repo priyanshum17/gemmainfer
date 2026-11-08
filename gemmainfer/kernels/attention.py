@@ -157,6 +157,26 @@ class GemmaAttention(nn.Module):
         else:
             new_kv_cache = (k, v)
 
+        if q_len == 1 and mask is None:
+            if self.sliding_window is not None and k.size(2) > self.sliding_window:
+                k_attn = k[:, :, -self.sliding_window :, :]
+                v_attn = v[:, :, -self.sliding_window :, :]
+            else:
+                k_attn, v_attn = k, v
+
+            try:
+                output = F.scaled_dot_product_attention(
+                    q, k_attn, v_attn, scale=self.scaling, enable_gqa=(self.num_key_value_groups > 1)
+                )
+            except TypeError:
+                if self.num_key_value_groups > 1:
+                    k_attn = k_attn.repeat_interleave(self.num_key_value_groups, dim=1)
+                    v_attn = v_attn.repeat_interleave(self.num_key_value_groups, dim=1)
+                output = F.scaled_dot_product_attention(q, k_attn, v_attn, scale=self.scaling)
+
+            output = output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+            return self.o_proj(output), new_kv_cache
+
         if self.num_key_value_groups > 1:
             k_expanded = k.repeat_interleave(self.num_key_value_groups, dim=1)
             v_expanded = v.repeat_interleave(self.num_key_value_groups, dim=1)

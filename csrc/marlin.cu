@@ -31,22 +31,30 @@ __global__ void marlin_w4a16_coalesced_kernel(
 
     const scalar_t* A_m = A + m * K;
     float acc = 0.0f;
-    int packed_K = K / 8;
+    int num_groups = K / group_size;
+    int words_per_group = group_size / 8;
 
-    for (int pk = 0; pk < packed_K; ++pk) {
-        int32_t packed_val = B_packed[pk * N + col];
-        int k_base = pk * 8;
-        int group_idx = k_base / group_size;
-        float scale = static_cast<float>(scales[group_idx * N + col]);
+    for (int g = 0; g < num_groups; ++g) {
+        float scale = static_cast<float>(scales[g * N + col]);
+        int pk_base = g * words_per_group;
+        float group_acc = 0.0f;
 
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            int k = k_base + i;
-            int32_t w_raw = (packed_val >> (i * 4)) & 0x0F;
-            float w = static_cast<float>(w_raw - 8);
-            float a = static_cast<float>(A_m[k]);
-            acc += a * (w * scale);
+        for (int w = 0; w < words_per_group; ++w) {
+            int pk = pk_base + w;
+            int32_t packed_val = B_packed[pk * N + col];
+            int k_base = pk * 8;
+
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int k = k_base + i;
+                int32_t w_raw = (packed_val >> (i * 4)) & 0x0F;
+                float w = static_cast<float>(w_raw - 8);
+                float a = static_cast<float>(A_m[k]);
+                group_acc += a * w;
+            }
         }
+        acc += group_acc * scale;
     }
 
     C[m * N + col] = static_cast<scalar_t>(acc);
@@ -81,34 +89,42 @@ __global__ void fused_moe_gate_up_kernel(
 
     int packed_K = K / 8;
     int stride_2I = 2 * I;
-    int group_stride = K / group_size;
+    int num_groups = K / group_size;
+    int words_per_group = group_size / 8;
 
     const int32_t* B_expert = B_all_packed + static_cast<size_t>(expert_id) * packed_K * stride_2I;
-    const scalar_t* S_expert = scales_all + static_cast<size_t>(expert_id) * group_stride * stride_2I;
+    const scalar_t* S_expert = scales_all + static_cast<size_t>(expert_id) * num_groups * stride_2I;
 
     float acc_gate = 0.0f;
     float acc_up = 0.0f;
 
-    for (int pk = 0; pk < packed_K; ++pk) {
-        int k_base = pk * 8;
-        int group_idx = k_base / group_size;
-
-        int32_t packed_gate = B_expert[pk * stride_2I + col];
-        int32_t packed_up = B_expert[pk * stride_2I + (col + I)];
-
-        float scale_gate = static_cast<float>(S_expert[group_idx * stride_2I + col]);
-        float scale_up = static_cast<float>(S_expert[group_idx * stride_2I + (col + I)]);
+    for (int g = 0; g < num_groups; ++g) {
+        float scale_gate = static_cast<float>(S_expert[g * stride_2I + col]);
+        float scale_up = static_cast<float>(S_expert[g * stride_2I + (col + I)]);
+        int pk_base = g * words_per_group;
+        float group_gate = 0.0f;
+        float group_up = 0.0f;
 
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            float a = static_cast<float>(A[k_base + i]);
+        for (int w = 0; w < words_per_group; ++w) {
+            int pk = pk_base + w;
+            int32_t packed_gate = B_expert[pk * stride_2I + col];
+            int32_t packed_up = B_expert[pk * stride_2I + (col + I)];
+            int k_base = pk * 8;
 
-            int32_t w_raw_gate = (packed_gate >> (i * 4)) & 0x0F;
-            acc_gate += a * (static_cast<float>(w_raw_gate - 8) * scale_gate);
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                float a = static_cast<float>(A[k_base + i]);
 
-            int32_t w_raw_up = (packed_up >> (i * 4)) & 0x0F;
-            acc_up += a * (static_cast<float>(w_raw_up - 8) * scale_up);
+                int32_t w_raw_gate = (packed_gate >> (i * 4)) & 0x0F;
+                group_gate += a * static_cast<float>(w_raw_gate - 8);
+
+                int32_t w_raw_up = (packed_up >> (i * 4)) & 0x0F;
+                group_up += a * static_cast<float>(w_raw_up - 8);
+            }
         }
+        acc_gate += group_gate * scale_gate;
+        acc_up += group_up * scale_up;
     }
 
     float act = gelu_tanh(acc_gate) * acc_up;
@@ -133,7 +149,8 @@ __global__ void fused_moe_down_accum_kernel(
     if (col >= K) return;
 
     int packed_I = I / 8;
-    int group_stride = I / group_size;
+    int num_groups = I / group_size;
+    int words_per_group = group_size / 8;
 
     float total_acc = 0.0f;
 
@@ -145,23 +162,29 @@ __global__ void fused_moe_down_accum_kernel(
         const scalar_t* act_k = out_acts + k_idx * I;
 
         const int32_t* B_expert = down_all_packed + static_cast<size_t>(expert_id) * packed_I * K;
-        const scalar_t* S_expert = down_scales_all + static_cast<size_t>(expert_id) * group_stride * K;
+        const scalar_t* S_expert = down_scales_all + static_cast<size_t>(expert_id) * num_groups * K;
 
         float expert_acc = 0.0f;
 
-        for (int pk = 0; pk < packed_I; ++pk) {
-            int i_base = pk * 8;
-            int group_idx = i_base / group_size;
-
-            int32_t packed_val = B_expert[pk * K + col];
-            float scale = static_cast<float>(S_expert[group_idx * K + col]);
+        for (int g = 0; g < num_groups; ++g) {
+            float scale = static_cast<float>(S_expert[g * K + col]);
+            int pk_base = g * words_per_group;
+            float group_acc = 0.0f;
 
             #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                float a = static_cast<float>(act_k[i_base + i]);
-                int32_t w_raw = (packed_val >> (i * 4)) & 0x0F;
-                expert_acc += a * (static_cast<float>(w_raw - 8) * scale);
+            for (int w = 0; w < words_per_group; ++w) {
+                int pk = pk_base + w;
+                int32_t packed_val = B_expert[pk * K + col];
+                int i_base = pk * 8;
+
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    float a = static_cast<float>(act_k[i_base + i]);
+                    int32_t w_raw = (packed_val >> (i * 4)) & 0x0F;
+                    group_acc += a * static_cast<float>(w_raw - 8);
+                }
             }
+            expert_acc += group_acc * scale;
         }
 
         total_acc += expert_acc * weight;
