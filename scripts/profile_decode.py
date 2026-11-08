@@ -50,7 +50,7 @@ def profile_decode():
     past_kv = model.init_kv_cache(batch_size=1, max_seq_len=2048, device=device, dtype=dtype)
     input_tensor = torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0)
     logits, past_kv = model(input_tensor, past_key_values=past_kv, return_logits_only_last=True)
-    curr_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(0).unsqueeze(0)
+    curr_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
 
     # 1. Component breakdown with CUDA Events
     num_profile_steps = 15
@@ -81,7 +81,7 @@ def profile_decode():
         start_event.record()
         with torch.inference_mode():
             logits, past_kv = model(curr_token, past_key_values=past_kv, return_logits_only_last=True)
-            next_tok = torch.argmax(logits[:, -1, :], dim=-1)
+            next_tok = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
         end_event.record()
 
         torch.cuda.synchronize()
@@ -90,7 +90,7 @@ def profile_decode():
         cpu_wall_ms = (t1 - t0) * 1000.0
 
         timings["total_step"].append((gpu_ms, cpu_wall_ms))
-        curr_token = next_tok.unsqueeze(0).unsqueeze(0)
+        curr_token = next_tok
 
     avg_gpu_ms = sum(g for g, c in timings["total_step"]) / len(timings["total_step"])
     avg_cpu_ms = sum(c for g, c in timings["total_step"]) / len(timings["total_step"])
@@ -120,7 +120,7 @@ def profile_decode():
         for _ in range(5):
             with torch.inference_mode():
                 logits, past_kv = model(curr_token, past_key_values=past_kv, return_logits_only_last=True)
-                curr_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(0).unsqueeze(0)
+                curr_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
             torch.cuda.synchronize()
 
     prof.export_chrome_trace(trace_path)
