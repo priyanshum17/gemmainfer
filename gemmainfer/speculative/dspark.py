@@ -110,10 +110,10 @@ class Gemma4AssistantDrafter:
             for k, v in shared_kv.items()
         }
 
-        pos_ids = torch.tensor([[cur_pos - 1]], dtype=torch.long, device=device)
         drafted_tokens = []
 
-        for _ in range(self.max_draft_len):
+        for step in range(self.max_draft_len):
+            pos_ids = torch.tensor([[cur_pos + step]], dtype=torch.long, device=device)
             token_emb = self.embed_tokens(curr_token)
             inputs_embeds = torch.cat([token_emb, curr_h], dim=-1)
 
@@ -216,4 +216,5 @@ class DSparkVerifier:
             bonus = selected[-1]
             accepted.append(bonus)
 
+        print(f"[SPEC DEBUG] draft={draft_tokens} selected={selected} n_matches={n_matches} accepted={accepted}", flush=True)
         return accepted, n_matches

@@ -1,3 +1,4 @@
+import time
 import uuid
 from typing import List, Optional, Any
 import torch
@@ -122,26 +123,31 @@ class GemmaInferEngine:
                     "sliding_attention": (past_kv[sliding_idx][0], past_kv[sliding_idx][1]),
                     "full_attention": (past_kv[full_idx][0], past_kv[full_idx][1]),
                 }
+                t0_draft = time.perf_counter()
                 draft = self.dspark.propose_draft(
                     tokens=tokens_so_far,
                     last_hidden_state=last_h,
                     shared_kv=shared_kv,
                     cur_pos=orig_kv_len,
                 )
+                t_draft_ms = (time.perf_counter() - t0_draft) * 1000.0
                 if draft:
                     cand_tokens = [seq.output_token_ids[-1]] + draft
                     cand_tensor = torch.tensor(cand_tokens, dtype=torch.long, device=self.device).unsqueeze(0)
+                    t0_verify = time.perf_counter()
                     all_logits, past_kv, all_hidden = self.model(
                         cand_tensor,
                         past_key_values=past_kv,
                         return_logits_only_last=False,
                         return_hidden_states=True,
                     )
+                    t_verify_ms = (time.perf_counter() - t0_verify) * 1000.0
                     accepted, n_matches = self.dspark.verify_tokens(
                         draft_tokens=draft,
                         logits=all_logits[0],
                         temperature=temperature,
                     )
+                    print(f"[CYCLE] draft_ms={t_draft_ms:.1f} verify_ms={t_verify_ms:.1f} draft={draft} matches={n_matches} accepted={accepted}", flush=True)
 
                     retained_len = orig_kv_len + 1 + n_matches
                     if isinstance(past_kv[0], tuple) and len(past_kv[0]) == 3:
