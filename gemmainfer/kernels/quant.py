@@ -14,26 +14,34 @@ def pack_to_marlin_w4a16(
     group_size: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize FP16/BF16 weights to 4-bit Marlin format with per-group scales."""
-    w = weight.t().contiguous()
-    K, N = w.shape
+    N, K = weight.shape
     assert K % group_size == 0
     assert K % 8 == 0
 
     num_groups = K // group_size
-    w_reshaped = w.view(num_groups, group_size, N)
-
-    max_val = w_reshaped.abs().amax(dim=1, keepdim=True).clamp(min=1e-5)
-    scales = (max_val / 7.0).squeeze(1).to(weight.dtype)
-
-    scales_expanded = scales.unsqueeze(1).expand_as(w_reshaped)
-    w_quant = torch.clamp(torch.round(w_reshaped / scales_expanded) + 8, 0, 15).to(torch.int32)
-    w_quant = w_quant.view(K, N)
-
     packed_K = K // 8
-    packed_weight = torch.zeros((packed_K, N), dtype=torch.int32, device=weight.device)
+    packed_weight = torch.empty((packed_K, N), dtype=torch.int32, device=weight.device)
+    scales = torch.empty((num_groups, N), dtype=weight.dtype, device=weight.device)
 
-    for i in range(8):
-        packed_weight |= (w_quant[i::8, :] & 0x0F) << (i * 4)
+    chunk_n = 32768
+    for n_start in range(0, N, chunk_n):
+        n_end = min(n_start + chunk_n, N)
+        cur_n = n_end - n_start
+        w_chunk = weight[n_start:n_end, :].t().contiguous()
+        w_reshaped = w_chunk.view(num_groups, group_size, cur_n)
+
+        max_val = w_reshaped.abs().amax(dim=1, keepdim=True).clamp(min=1e-5)
+        s_chunk = (max_val / 7.0).squeeze(1).to(weight.dtype)
+        scales[:, n_start:n_end].copy_(s_chunk)
+
+        scales_expanded = s_chunk.unsqueeze(1).expand_as(w_reshaped)
+        w_quant = torch.clamp(torch.round(w_reshaped / scales_expanded) + 8, 0, 15).to(torch.int32)
+        w_quant = w_quant.view(K, cur_n)
+
+        p_chunk = torch.zeros((packed_K, cur_n), dtype=torch.int32, device=weight.device)
+        for i in range(8):
+            p_chunk |= (w_quant[i::8, :] & 0x0F) << (i * 4)
+        packed_weight[:, n_start:n_end].copy_(p_chunk)
 
     return packed_weight, scales
 
@@ -107,7 +115,7 @@ class MarlinLinear(nn.Module):
             group_size=group_size,
             bias=linear.bias is not None,
             dtype=linear.weight.dtype,
-        )
+        ).to(device=linear.weight.device)
         packed, scales = pack_to_marlin_w4a16(linear.weight, group_size=group_size)
         marlin.packed_weight.copy_(packed)
         marlin.scales.copy_(scales)

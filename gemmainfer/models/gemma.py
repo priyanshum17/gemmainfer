@@ -82,23 +82,36 @@ class GemmaBatchedMoE(nn.Module):
         out = torch.zeros_like(x_flat)
 
         if self.quant_method == "w4a16":
-            if _HAS_CSRC and hasattr(gemmainfer_csrc, "fused_batched_moe") and num_tokens <= 16:
-                # Single C++/CUDA call across all num_tokens with Token-Union expert deduplication
-                gemmainfer_csrc.fused_batched_moe(
-                    x_flat,
-                    self.gate_up_packed,
-                    self.gate_up_scales,
-                    self.down_packed,
-                    self.down_scales,
-                    indices.to(torch.int32),
-                    weights,
-                    out,
-                    self.gu_group_size,
-                )
+            if _HAS_CSRC and hasattr(gemmainfer_csrc, "fused_batched_moe"):
+                idx_i32 = indices.to(torch.int32)
+                if num_tokens <= 8:
+                    gemmainfer_csrc.fused_batched_moe(
+                        x_flat,
+                        self.gate_up_packed,
+                        self.gate_up_scales,
+                        self.down_packed,
+                        self.down_scales,
+                        idx_i32,
+                        weights,
+                        out,
+                        self.gu_group_size,
+                    )
+                else:
+                    for start in range(0, num_tokens, 8):
+                        end = min(start + 8, num_tokens)
+                        gemmainfer_csrc.fused_batched_moe(
+                            x_flat[start:end],
+                            self.gate_up_packed,
+                            self.gate_up_scales,
+                            self.down_packed,
+                            self.down_scales,
+                            idx_i32[start:end],
+                            weights[start:end],
+                            out[start:end],
+                            self.gu_group_size,
+                        )
                 return out.view(orig_shape)
 
-            # Fallback for large prefill batches (num_tokens > 16) or when C++ extension is unavailable:
-            # Group by unique active expert so each touched expert is dequantized only once.
             flat_indices = indices.view(-1)
             token_indices = (
                 torch.arange(num_tokens, device=x.device)
@@ -133,7 +146,6 @@ class GemmaBatchedMoE(nn.Module):
 
             return out.view(orig_shape)
 
-        # Unquantized path
         flat_indices = indices.view(-1)
         token_indices = (
             torch.arange(num_tokens, device=x.device)
@@ -265,7 +277,6 @@ class GemmaForCausalLM(nn.Module):
         for layer in self.layers:
             attn = layer.self_attn
             if attn.sliding_window is not None:
-                # Bounded SWA capacity with 64-token headroom for speculative verification & rollback
                 layer_cap = min(max_seq_len, attn.sliding_window + 64)
             else:
                 layer_cap = max_seq_len
@@ -280,7 +291,6 @@ class GemmaForCausalLM(nn.Module):
                 device=device,
                 dtype=dtype,
             )
-            # meta = [logical_seq_len, physical_buf_pos]
             meta = [0, 0]
             cache.append((k_buf, v_buf, meta))
         return cache
@@ -308,6 +318,21 @@ class GemmaForCausalLM(nn.Module):
 
         hidden_states = (self.embed_tokens(input_ids) * (self.config.hidden_size ** 0.5)).to(dtype=self.embed_tokens.weight.dtype)
 
+        shared_mask = None
+        if seq_len > 1:
+            if past_key_values is None or past_key_values[0] is None:
+                total_k_len = seq_len
+            elif isinstance(past_key_values[0], tuple) and len(past_key_values[0]) == 3:
+                total_k_len = past_key_values[0][2][0] + seq_len
+            else:
+                total_k_len = past_key_values[0][0].shape[2] + seq_len
+            if self.config.sliding_window is None or total_k_len <= self.config.sliding_window:
+                causal_diag = total_k_len - seq_len + 1
+                shared_mask = torch.triu(
+                    torch.full((seq_len, total_k_len), float("-inf"), device=hidden_states.device, dtype=hidden_states.dtype),
+                    diagonal=causal_diag,
+                ).unsqueeze(0).unsqueeze(0)
+
         new_past_key_values = []
         for i, layer in enumerate(self.layers):
             layer_past = past_key_values[i] if past_key_values is not None else None
@@ -315,6 +340,7 @@ class GemmaForCausalLM(nn.Module):
                 hidden_states=hidden_states,
                 position_ids=position_ids,
                 kv_cache=layer_past,
+                mask=shared_mask,
             )
             new_past_key_values.append(new_kv)
 

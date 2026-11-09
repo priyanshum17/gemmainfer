@@ -1,56 +1,38 @@
 # GemmaInfer
 
-A high-performance C++/CUDA inference engine for **Gemma 4 26B A4B** (25.2B total / 3.8B active parameters) optimized for **24GB consumer GPUs** (NVIDIA GeForce RTX 3090 / 4090).
+High-performance C++/CUDA inference engine for **Gemma 4 26B A4B** (25.2B total / 3.8B active parameters) built for **24GB consumer GPUs** (NVIDIA GeForce RTX 3090 / 4090).
 
-GemmaInfer delivers production-grade single-stream interactive decode speeds by combining **Split-K MoE kernel fusion**, **collaborative on-chip shared memory caching**, and **cross-model speculative verification** with Google's official companion assistant model (`google/gemma-4-26B-A4B-it-assistant`).
-
----
-
-## Architecture
-
-```mermaid
-flowchart LR
-    A["Prompt Tokens"] --> B["Base Model Prefill"]
-    B --> C["Shared KV States (L28 / L29)"]
-    C --> D["Multi-Token MTP Drafter"]
-    D --> E["Batched Split-K Verification"]
-    B --> E
-    E --> F["Streaming Output"]
-```
+GemmaInfer combines **Token-Union W4A16 MoE kernels**, **tiled Split-K GEMMs**, **chunked prefill routing**, and **cross-model speculative decoding** with `google/gemma-4-26B-A4B-it-assistant`.
 
 ---
 
-## Performance Benchmarks (RTX 3090 24GB)
+## Benchmarks (RTX 3090 24GB)
 
-Live benchmark on NVIDIA GeForce RTX 3090 (24GB VRAM, PCIe 4.0, CUDA 13.2) generating 64 completion tokens:
+Verified on NVIDIA GeForce RTX 3090 (24GB VRAM, CUDA 13.2) generating 64 tokens:
 
-| Engine | Quantization / Method | Single-Stream Decode Speed | Speedup vs Baseline |
-| :--- | :--- | :--- | :--- |
-| **GemmaInfer (Speculative MTP, $K=6$)** | **W4A16 Token-Union + Direct CUDA Drafter** | **79.22 tok/s** | **5.77x faster** |
-| **GemmaInfer (Adaptive Speculative MTP)** | **W4A16 Token-Union + Adaptive Drafter ($K=4\leftrightarrow 6$)** | **76.14 tok/s** | **5.55x faster** |
-| **GemmaInfer (Autoregressive)** | W4A16 Split-K + Fused RoPE/RMSNorm | **30.99 tok/s** | **2.26x faster** |
-| **`llama.cpp`** | GGUF Q4_K_M (`--flash-attn`) | 22.50 tok/s | 1.64x faster |
-| **vLLM** | W4A16 / AWQ Triton MoE | 20.60 tok/s | 1.50x faster |
-| *Original Baseline* | Naive Autoregressive W4A16 | 13.72 tok/s | 1.00x (Reference) |
-
-*GemmaInfer breaks through the physical GDDR6X single-token memory bandwidth roofline by drafting 4–6 tokens in ~2.9 ms/step with zero CPU-GPU sync and verifying all candidates in a single register-unrolled Token-Union target pass.*
+| Mode | Configuration | Decode Throughput | TTFT (Prefill) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **GemmaInfer (Speculative, $K=6$)** | **W4A16 Token-Union + Direct CUDA Drafter** | **79.22 tok/s** | **178.7 ms** | **5.77x** |
+| **GemmaInfer (Adaptive Speculative)** | **W4A16 Token-Union + Adaptive Drafter ($K=4\leftrightarrow 6$)** | **76.14 tok/s** | **178.7 ms** | **5.55x** |
+| **GemmaInfer (Autoregressive)** | **W4A16 Split-K + Fused RoPE/RMSNorm** | **31.03 tok/s** | **178.7 ms** | **2.26x** |
+| `llama.cpp` | GGUF Q4_K_M (`--flash-attn`) | 22.50 tok/s | — | 1.64x |
+| vLLM | W4A16 / AWQ Triton MoE | 20.60 tok/s | — | 1.50x |
+| *Baseline* | Naive Autoregressive W4A16 | 13.72 tok/s | 691.8 ms | 1.00x |
 
 ---
 
-## Core Acceleration Techniques
+## Core Optimizations
 
-- **Split-K Grid Reduction:** Partitions the GEMM reduction dimension across 8 concurrent threadblocks (`split_k = 8`), launching 88 blocks to achieve 100% compute occupancy across all 82 SMs on Ampere GPUs.
-- **Multi-Token MoE Kernel Fusion:** Fuses gate projection, up projection, GeLU tanh activation, down projection, and native BF16 hardware atomic accumulation into vectorized batch dispatches, eliminating thousands of runtime Python kernel launches.
-- **Cross-Model KV-Sharing:** Reuses sliding window (layer 28) and full attention (layer 29) key-value states directly across model boundaries, allowing the companion drafter to predict multi-token sequences in under 5 ms without recomputing projections.
-- **Hoisted Scale Dequantization:** Caches quantization scale factors once per weight group, removing redundant memory fetches across unrolled inner loops.
-- **Collaborative Shared Memory Caching:** Stashes active token activations in fast on-chip `__shared__` memory buffers to eliminate repeated L2/DRAM roundtrips.
-- **SWA Bounded Ring-Buffer Management:** Recycles physical memory pages across 1,024-token sliding window attention layers, slashing KV cache memory pressure by over 70%.
+- **Token-Union W4A16 MoE (`csrc/marlin.cu`):** Deduplicates active experts across speculative batches (`1 <= M <= 8`), loading each unique expert once into registers and dispatching exact 64-thread blocks (`11` blocks/slot) with native `__nv_bfloat16` atomic reduction.
+- **Chunked Prefill MoE Routing:** Slices prefill batches (`M > 8`) into 8-token chunks routed through `fused_batched_moe`, reducing Time-To-First-Token (`TTFT`) from `691.8 ms` to **`178.7 ms`** (`3.87x` faster).
+- **Tiled 128-Thread Wide GEMM (`lm_head`):** Caps shared memory per block to `16 KB` for wide output projections (`N >= 16384`) while retaining `split_k = 8` for narrow projections, accelerating `lm_head (M=6)` by **`1.69x`** (`4.29 ms` $\to$ `2.54 ms`).
+- **Direct CUDA Multi-Token Drafter (`dspark.py`):** Shares target KV caches (layers 28 & 29) and executes the 4-layer assistant drafter in `~2.9 ms` with fused in-place RoPE/RMSNorm and a single device-to-host sync per draft cycle.
+- **Bounded SWA Ring-Compaction:** Caps sliding-window KV caches to `sliding_window + 64` tokens with zero-copy speculative rollback.
 
 ---
 
 ## Quick Start
 
-### Build & Install
 ```bash
 git clone https://github.com/priyanshum17/gemmainfer.git
 cd gemmainfer
@@ -58,7 +40,15 @@ pip install -e .
 python setup.py build_ext --inplace
 ```
 
-### Launch OpenAI-Compatible API Server
+### Run Speculative Benchmark
+```bash
+python scripts/test_speculative.py \
+  --model-path /path/to/gemma-4-26B-A4B-it-W4A16 \
+  --assistant-model-path /path/to/gemma-4-26B-A4B-it-assistant \
+  --max-tokens 64
+```
+
+### Launch OpenAI-Compatible Server
 ```bash
 python scripts/serve.py \
   --model-path /path/to/gemma-4-26B-A4B-it-W4A16 \
@@ -66,34 +56,7 @@ python scripts/serve.py \
   --host 0.0.0.0 --port 8000
 ```
 
-### Python API
-```python
-import torch
-from gemmainfer.models.config import GemmaConfig
-from gemmainfer.core.engine import GemmaInferEngine
-
-config = GemmaConfig.gemma_4_26b_a4b()
-config.quant_method = "w4a16"
-
-engine = GemmaInferEngine(
-    config=config,
-    device="cuda",
-    dtype=torch.bfloat16,
-    enable_dspark=True,
-)
-
-tokens = engine.generate(prompt_token_ids=[2, 106, 1645, 108], max_tokens=64)
-print("Generated tokens:", tokens)
-```
-
----
-
-## Verification
-
+### Verify Test Suite
 ```bash
-# Run unit test suite
-pytest tests/
-
-# Benchmark live server endpoint
-python scripts/benchmark_client.py
+pytest -v tests/
 ```

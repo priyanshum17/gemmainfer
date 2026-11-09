@@ -170,7 +170,6 @@ void launch_fused_rope_inplace(
     const torch::Tensor& sin,
     const torch::Tensor& position_ids
 ) {
-    // q: [B, H_q, S, D], k: [B, H_k, S, D] (or empty)
     int B = q.size(0);
     int H_q = q.size(1);
     int S = q.size(2);

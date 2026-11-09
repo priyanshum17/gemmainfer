@@ -106,8 +106,6 @@ class Gemma4AssistantDrafter:
     ) -> List[int]:
         """Propose draft tokens using companion model and shared KV states."""
         device = last_hidden_state.device
-        # Use forced_first_token (the newly sampled bonus_tok at cur_pos) when provided,
-        # otherwise use last_token_id.
         start_tok = forced_first_token if forced_first_token is not None else last_token_id
         curr_token = torch.tensor([[start_tok]], dtype=torch.long, device=device)
 
@@ -117,7 +115,6 @@ class Gemma4AssistantDrafter:
         elif curr_h.shape[1] > 1:
             curr_h = curr_h[:, -1:, :]
 
-        # Crop shared KV states up to cur_pos (the validated target KV cache length)
         cropped_kv = {}
         for k, v in shared_kv.items():
             k_t = v[0][:, :, :cur_pos, :] if v[0].size(2) > cur_pos else v[0]
@@ -171,7 +168,6 @@ class Gemma4AssistantDrafter:
         device = curr_h.device
         zero_pos = torch.zeros((1, 1), dtype=torch.long, device=device)
 
-        # Precompute rotary embeddings ONCE for constant pos_ids across all draft steps
         pe_cache = {}
         for lt in m.unique_layer_types:
             cos, sin = m.rotary_emb(curr_h, pos_ids, lt)
@@ -215,7 +211,11 @@ class Gemma4AssistantDrafter:
                 h = h * layer.layer_scalar
 
             h = m.norm(h)
-            if getattr(asst.config, "use_ordered_embeddings", False) and asst.masked_embedding is not None:
+            if (
+                getattr(asst.config, "use_ordered_embeddings", False)
+                and asst.masked_embedding is not None
+                and hasattr(asst.lm_head, "weight")
+            ):
                 logits = asst.masked_embedding(h, asst.lm_head.weight)
             else:
                 logits = asst.lm_head(h)
@@ -227,7 +227,6 @@ class Gemma4AssistantDrafter:
                 curr_token = next_token
                 curr_h = asst.post_projection(h)
 
-        # Single GPU->CPU sync for all drafted tokens at once
         all_drafted = torch.cat(drafted_tensors, dim=1)[0].tolist()
         trimmed: List[int] = []
         for tok_val in all_drafted:

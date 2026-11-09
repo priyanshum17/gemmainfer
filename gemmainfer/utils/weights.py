@@ -159,7 +159,6 @@ def load_gemma_from_hf(
                                 layer.moe.gate_up_scales[exp_idx, :, layer.moe.moe_intermediate_size:].copy_(t.t().to(device=device, dtype=dtype))
 
         if isinstance(model.lm_head, MarlinLinear):
-            # Quantize tied embedding weights into W4A16 MarlinLinear for lm_head (saves 1.1 GB HBM read/step)
             packed, scales = pack_to_marlin_w4a16(
                 model.embed_tokens.weight.data,
                 group_size=config.quant_group_size,

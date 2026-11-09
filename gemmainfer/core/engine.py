@@ -126,10 +126,6 @@ class GemmaInferEngine:
             dtype=self.dtype,
         )
 
-        # Prefill prompt tokens [0 .. L-1]:
-        # - past_kv now holds KV states for positions [0 .. L-1] (length L)
-        # - last_h holds the target hidden state at position L-1
-        # - bonus_tok is the target prediction for position L (yielded immediately)
         logits, past_kv, last_h = self.model(
             input_ids,
             past_key_values=past_kv,
@@ -144,7 +140,6 @@ class GemmaInferEngine:
         if bonus_tok in eos_tokens or seq.is_finished:
             return
 
-        # Precompute last sliding_attention and full_attention layer indices for cross-model KV sharing
         sliding_idx = -1
         full_idx = -1
         for i in range(len(past_kv) - 1, -1, -1):
@@ -166,7 +161,6 @@ class GemmaInferEngine:
             tokens_so_far = seq.prompt_token_ids + seq.output_token_ids
             orig_logical_len = past_kv[0][2][0]
 
-            # Draft continuation tokens [d_1, ..., d_k] that follow bonus_tok
             draft_cont: List[int] = []
             if self.dspark is not None:
                 if self.dspark.assistant_drafter is not None:
@@ -189,7 +183,6 @@ class GemmaInferEngine:
                 else:
                     draft_cont = self.dspark.fallback_cache.propose(tokens_so_far)
 
-            # Single-pass verification batch: [bonus_tok, d_1, ..., d_k]
             verify_list = [bonus_tok] + draft_cont
             verify_tensor = torch.tensor([verify_list], dtype=torch.long, device=self.device)
             num_verify = len(verify_list)
@@ -211,8 +204,7 @@ class GemmaInferEngine:
                 )
                 all_hidden = None
 
-            # Verify draft_cont against target logits at positions [0 .. num_verify-1]
-            n_matches = 1  # verify_list[0] == bonus_tok is already guaranteed valid
+            n_matches = 1
             newly_accepted: List[int] = []
 
             if temperature <= 1e-5:
@@ -240,7 +232,6 @@ class GemmaInferEngine:
                     next_bonus = _sample_token(all_logits[0, num_verify - 1, :], temperature=temperature, top_p=top_p)
                     newly_accepted.append(next_bonus)
 
-            # Roll back rejected speculative slots in KV cache metadata (zero-copy rollback)
             dropped = num_verify - n_matches
             if dropped > 0:
                 for layer_kv in past_kv:
@@ -262,13 +253,11 @@ class GemmaInferEngine:
                 if tok in eos_tokens or seq.is_finished:
                     return
 
-            # Adaptive draft horizon: expand to 6 on full-match streaks, reset to base_draft_len on rejection
             if num_verify > 1 and n_matches == num_verify:
                 cur_draft_len = min(6, cur_draft_len + 2)
             else:
                 cur_draft_len = base_draft_len
 
-            # Synchronize state for the next cycle directly from the verification pass (ZERO extra forward passes!)
             if all_hidden is not None:
                 last_h = all_hidden[:, n_matches - 1 : n_matches, :]
             bonus_tok = newly_accepted[-1]

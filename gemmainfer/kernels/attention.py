@@ -176,8 +176,6 @@ class GemmaAttention(nn.Module):
                 buf_cap = k_buf.size(2)
 
                 if q_len > buf_cap:
-                    # Prefill exceeds bounded SWA buffer capacity: attend over full prefill k, v,
-                    # and retain the trailing sliding_window tokens in the buffer.
                     keep = min(q_len, self.sliding_window or buf_cap, buf_cap)
                     k_buf[:, :, :keep, :].copy_(k[:, :, -keep:, :])
                     v_buf[:, :, :keep, :].copy_(v[:, :, -keep:, :])
@@ -186,8 +184,6 @@ class GemmaAttention(nn.Module):
                     new_kv_cache = (k_buf, v_buf, meta)
                 else:
                     if buf_pos + q_len > buf_cap:
-                        # Speculation-safe window compaction: slide active window to start of buffer,
-                        # preserving headroom for speculative verification & rollback.
                         win = self.sliding_window or (buf_cap - q_len)
                         keep = min(buf_pos, max(win - 1, 1), buf_cap - q_len)
                         if keep > 0:
@@ -234,7 +230,6 @@ class GemmaAttention(nn.Module):
             output = output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
             return self.o_proj(output), new_kv_cache
 
-        # Multi-token verification or prefill (q_len > 1)
         if self.sliding_window is not None and k.size(2) > self.sliding_window + q_len:
             win_span = self.sliding_window + q_len
             k_attn = k[:, :, -win_span:, :]
@@ -243,14 +238,14 @@ class GemmaAttention(nn.Module):
             k_attn, v_attn = k, v
 
         total_k_len = k_attn.size(2)
-        attn_mask = mask
+        attn_mask = mask if (mask is not None and mask.size(-1) == total_k_len) else None
         if attn_mask is None and q_len > 1:
             causal_diag = total_k_len - q_len + 1
             attn_mask = torch.triu(
                 torch.full((q_len, total_k_len), float("-inf"), device=q.device, dtype=q.dtype),
                 diagonal=causal_diag,
             )
-            if self.sliding_window is not None:
+            if self.sliding_window is not None and total_k_len > self.sliding_window:
                 window_diag = total_k_len - q_len - self.sliding_window
                 window_mask = torch.tril(
                     torch.full((q_len, total_k_len), float("-inf"), device=q.device, dtype=q.dtype),
