@@ -8,16 +8,21 @@ GemmaInfer combines **Token-Union W4A16 MoE kernels**, **tiled Split-K GEMMs**, 
 
 ## Benchmarks (RTX 3090 24GB)
 
-Verified on NVIDIA GeForce RTX 3090 (24GB VRAM, CUDA 13.2) generating 64 tokens:
+Verified on NVIDIA GeForce RTX 3090 (24GB VRAM, CUDA 13.2) generating 64 tokens (`178.7 ms` TTFT vs `691.8 ms` baseline):
 
-| Mode | Configuration | Decode Throughput | TTFT (Prefill) | Speedup |
-| :--- | :--- | :--- | :--- | :--- |
-| **GemmaInfer (Speculative, $K=6$)** | **W4A16 Token-Union + Direct CUDA Drafter** | **79.22 tok/s** | **178.7 ms** | **5.77x** |
-| **GemmaInfer (Adaptive Speculative)** | **W4A16 Token-Union + Adaptive Drafter ($K=4\leftrightarrow 6$)** | **76.14 tok/s** | **178.7 ms** | **5.55x** |
-| **GemmaInfer (Autoregressive)** | **W4A16 Split-K + Fused RoPE/RMSNorm** | **31.03 tok/s** | **178.7 ms** | **2.26x** |
-| `llama.cpp` | GGUF Q4_K_M (`--flash-attn`) | 22.50 tok/s | — | 1.64x |
-| vLLM | W4A16 / AWQ Triton MoE | 20.60 tok/s | — | 1.50x |
-| *Baseline* | Naive Autoregressive W4A16 | 13.72 tok/s | 691.8 ms | 1.00x |
+```mermaid
+xychart-beta
+    title "Single-Stream Decode Throughput (tok/s)"
+    x-axis ["GI-Spec", "GI-AR", "llama.cpp", "vLLM", "Baseline"]
+    y-axis "Tokens / sec" 0 --> 90
+    bar [79.22, 31.03, 22.50, 20.60, 13.72]
+```
+
+- **GI-Spec (`79.22 tok/s`, `5.77x`):** GemmaInfer W4A16 Token-Union + Direct CUDA Drafter ($K=6$)
+- **GI-AR (`31.03 tok/s`, `2.26x`):** GemmaInfer W4A16 Split-K + Fused RoPE/RMSNorm
+- **llama.cpp (`22.50 tok/s`, `1.64x`):** GGUF Q4_K_M (`--flash-attn`)
+- **vLLM (`20.60 tok/s`, `1.50x`):** W4A16 / AWQ Triton MoE
+- **Baseline (`13.72 tok/s`, `1.00x`):** Naive Autoregressive W4A16
 
 ---
 
