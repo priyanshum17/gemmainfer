@@ -6,6 +6,20 @@ GemmaInfer combines **Token-Union W4A16 MoE kernels**, **tiled Split-K GEMMs**, 
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart LR
+    A["Prompt Tokens"] --> B["Chunked Prefill MoE"]
+    B --> C["Shared KV (L28 / L29)"]
+    C --> D["Direct CUDA Drafter (K=6)"]
+    D --> E["Token-Union Verification"]
+    B --> E
+    E --> F["Streaming Output"]
+```
+
+---
+
 ## Benchmarks (RTX 3090 24GB)
 
 Verified on NVIDIA GeForce RTX 3090 (24GB VRAM, CUDA 13.2) generating 64 tokens (`178.7 ms` TTFT vs `691.8 ms` baseline):
