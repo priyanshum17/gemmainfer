@@ -38,7 +38,6 @@ if HAS_TORCH:
         sources += [
             "csrc/rmsnorm.cu",
             "csrc/softcapping.cu",
-            "csrc/paged_swa_attention.cu",
             "csrc/marlin.cu",
         ]
         extra_compile_args["nvcc"] = [

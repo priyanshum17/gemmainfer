@@ -6,6 +6,7 @@ from safetensors import safe_open
 
 from gemmainfer.models.config import GemmaConfig
 from gemmainfer.models.gemma import GemmaForCausalLM
+from gemmainfer.kernels.quant import MarlinLinear, pack_to_marlin_w4a16
 
 
 def load_gemma_from_hf(
@@ -157,6 +158,15 @@ def load_gemma_from_hf(
                             elif proj_name == "up_proj" and param_type == "weight_scale":
                                 layer.moe.gate_up_scales[exp_idx, :, layer.moe.moe_intermediate_size:].copy_(t.t().to(device=device, dtype=dtype))
 
-        model.lm_head.weight = model.embed_tokens.weight
+        if isinstance(model.lm_head, MarlinLinear):
+            # Quantize tied embedding weights into W4A16 MarlinLinear for lm_head (saves 1.1 GB HBM read/step)
+            packed, scales = pack_to_marlin_w4a16(
+                model.embed_tokens.weight.data,
+                group_size=config.quant_group_size,
+            )
+            model.lm_head.packed_weight.data.copy_(packed)
+            model.lm_head.scales.data.copy_(scales)
+        else:
+            model.lm_head.weight = model.embed_tokens.weight
 
     return model, config

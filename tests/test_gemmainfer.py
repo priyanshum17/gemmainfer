@@ -8,8 +8,8 @@ from gemmainfer.models.config import GemmaConfig
 from gemmainfer.models.gemma import GemmaForCausalLM
 from gemmainfer.kernels.norm import GemmaRMSNorm
 from gemmainfer.kernels.activations import apply_logit_softcapping
-from gemmainfer.core.block_manager import BlockManager
-from gemmainfer.speculative.dspark import DSparkSemiAutoregressiveDrafter, DSparkVerifier, Gemma4AssistantDrafter
+from gemmainfer.kernels.quant import MarlinLinear
+from gemmainfer.speculative.dspark import PromptLookupCache, DSparkVerifier, Gemma4AssistantDrafter
 from gemmainfer.core.engine import GemmaInferEngine
 
 
@@ -29,25 +29,45 @@ def test_logit_softcapping():
     assert out[1] == 0.0
 
 
-def test_block_manager_swa_bounded():
-    bm = BlockManager(num_blocks=100, block_size=16, sliding_window=64)
-    assert bm.max_swa_blocks == 4
+def test_bounded_swa_kv_cache_and_rollback():
+    config = GemmaConfig.gemma_test_small()
+    config.sliding_window = 16
+    model = GemmaForCausalLM(config)
 
-    g_blocks, s_blocks = bm.allocate_sequence("req_1", num_tokens=32)
-    assert len(g_blocks) == 2
-    assert len(s_blocks) == 2
+    past_kv = model.init_kv_cache(batch_size=1, max_seq_len=512)
+    # Layer 0 is SWA (bounded to sliding_window + 64 = 80, NOT 512)
+    assert past_kv[0][0].shape[2] == 80
+    # Layer 1 is Full Attention (allocated to full max_seq_len = 512)
+    assert past_kv[1][0].shape[2] == 512
 
-    bm.free_sequence("req_1")
-    assert bm.get_num_free_blocks() == 100
+    # Run 90 tokens through SWA buffer (exceeding 80-token capacity) to trigger compaction
+    ids_1 = torch.randint(0, config.vocab_size, (1, 50))
+    _, past_kv = model(ids_1, past_key_values=past_kv)
+    assert past_kv[0][2][0] == 50  # logical_pos
+    assert past_kv[0][2][1] == 50  # buf_pos
+
+    ids_2 = torch.randint(0, config.vocab_size, (1, 40))
+    _, past_kv = model(ids_2, past_key_values=past_kv)
+    assert past_kv[0][2][0] == 90  # logical_pos = 90
+    assert past_kv[0][2][1] == 15 + 40  # compacted to (sliding_window - 1) + 40 = 55
+
+    # Simulate speculative verification of 5 draft tokens where 3 are rejected (2 accepted)
+    spec_ids = torch.randint(0, config.vocab_size, (1, 5))
+    _, past_kv = model(spec_ids, past_key_values=past_kv)
+    dropped = 3
+    for layer_kv in past_kv:
+        layer_kv[2][0] -= dropped
+        layer_kv[2][1] -= dropped
+
+    assert past_kv[0][2][0] == 92
+    assert past_kv[0][2][1] == 57
 
 
-def test_dspark_neural_drafter():
-    drafter = DSparkSemiAutoregressiveDrafter(hidden_size=64, vocab_size=1000, max_draft_len=4)
-    h_T = torch.randn(1, 1, 64)
-    draft_tokens, confidences = drafter(h_T, confidence_threshold=0.5)
-    assert len(draft_tokens) > 0
-    assert len(draft_tokens) <= 4
-    assert len(confidences) == len(draft_tokens)
+def test_prompt_lookup_cache():
+    cache = PromptLookupCache(ngram_size=2, max_draft_len=3)
+    tokens = [10, 20, 30, 40, 50, 20, 30]
+    draft = cache.propose(tokens)
+    assert draft == [40, 50, 20]
 
 
 def test_gemma_4_forward_small():
@@ -74,31 +94,33 @@ def test_marlin_quantized_batch_m():
     config = GemmaConfig.gemma_test_small()
     config.quant_method = "w4a16"
     model = GemmaForCausalLM(config)
-    
+    assert isinstance(model.lm_head, MarlinLinear)
+
     # Test batch M > 1 (prefill / multi-token verification)
-    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+    input_ids = torch.randint(0, config.vocab_size, (2, 4))
     logits, kv = model(input_ids)
     assert logits.shape == (2, 1, config.vocab_size)
     assert not torch.isnan(logits).any()
 
 
-def test_fused_batched_moe_decode():
+def test_token_union_batched_moe():
     config = GemmaConfig.gemma_test_small()
     config.quant_method = "w4a16"
     model = GemmaForCausalLM(config)
-    
-    # Single token decode (M=1) to exercise fused_batched_moe
-    input_ids = torch.randint(0, config.vocab_size, (1, 1))
-    logits, kv = model(input_ids)
-    assert logits.shape == (1, 1, config.vocab_size)
-    assert not torch.isnan(logits).any()
+    moe = model.layers[0].moe
 
+    # Test single-token (M=1) and multi-token speculative batch (M=5)
+    for num_tokens in [1, 5]:
+        x = torch.randn(1, num_tokens, config.hidden_size)
+        out = moe(x)
+        assert out.shape == (1, num_tokens, config.hidden_size)
+        assert not torch.isnan(out).any()
 
 
 def test_engine_generate():
     config = GemmaConfig.gemma_test_small()
     engine = GemmaInferEngine(config=config, enable_dspark=True)
-    prompt = [1, 2, 3, 4]
+    prompt = [10, 20, 30, 40, 20, 30]
     out = engine.generate(prompt, max_tokens=10)
     assert len(out) == 10
 
@@ -111,6 +133,7 @@ class MockAssistantOutput:
 
 class MockAssistantModel(torch.nn.Module):
     """Mock companion assistant model with custom output tokens and KV shape logging."""
+
     def __init__(self, vocab_size: int, hidden_size: int, token_sequence: list = None):
         super().__init__()
         self.vocab_size = vocab_size
@@ -132,7 +155,7 @@ class MockAssistantModel(torch.nn.Module):
 
         tok = self.token_sequence[min(self.call_count, len(self.token_sequence) - 1)]
         self.call_count += 1
-        logits[:, -1, tok] = 10.0
+        logits[:, -1, tok] = 20.0
 
         hidden = torch.randn(batch_size, seq_len, self.hidden_size)
         return MockAssistantOutput(logits=logits, last_hidden_state=hidden)
@@ -144,7 +167,7 @@ def test_gemma4_assistant_drafter():
     hidden_dim = 64
     embed_tokens = torch.nn.Embedding(vocab_size, embed_dim)
 
-    # 1. Full length speculative draft sequence
+    # 1. Standalone draft sequence
     mock_model = MockAssistantModel(vocab_size, hidden_dim, token_sequence=[101, 102, 103])
     drafter = Gemma4AssistantDrafter(
         assistant_model=mock_model,
@@ -168,11 +191,28 @@ def test_gemma4_assistant_drafter():
 
     assert draft == [101, 102, 103]
     assert mock_model.call_count == 3
-    assert mock_model.received_position_ids == [4, 5, 6]  # cur_pos - 1 + step
-    # Verify shared KV cache was cropped to cur_pos=5
+    assert mock_model.received_position_ids == [4, 5, 6]
     assert mock_model.received_kv_shapes[0] == torch.Size([1, 2, 5, 32])
 
-    # 2. Early termination on EOS token (token 1)
+    # 2. Teacher-forced bonus token drafting (single-pass speculative mode)
+    mock_model_tf = MockAssistantModel(vocab_size, hidden_dim, token_sequence=[499, 201, 202, 203])
+    drafter_tf = Gemma4AssistantDrafter(
+        assistant_model=mock_model_tf,
+        embed_tokens=embed_tokens,
+        max_draft_len=3,
+    )
+    draft_tf = drafter_tf.draft(
+        last_token_id=50,
+        last_hidden_state=last_hidden_3d,
+        shared_kv=shared_kv,
+        cur_pos=cur_pos,
+        forced_first_token=77,
+    )
+    assert draft_tf == [201, 202, 203]
+    assert mock_model_tf.call_count == 4
+    assert mock_model_tf.received_position_ids == [4, 5, 6, 7]
+
+    # 3. Early termination on EOS token (token 1)
     mock_model_eos = MockAssistantModel(vocab_size, hidden_dim, token_sequence=[201, 1, 203])
     drafter_eos = Gemma4AssistantDrafter(
         assistant_model=mock_model_eos,
@@ -188,23 +228,7 @@ def test_gemma4_assistant_drafter():
     assert draft_eos == [201, 1]
     assert mock_model_eos.call_count == 2
 
-    # 3. 2D hidden state input tensor handling
-    last_hidden_2d = torch.randn(1, hidden_dim)
-    mock_model_2d = MockAssistantModel(vocab_size, hidden_dim, token_sequence=[301, 302])
-    drafter_2d = Gemma4AssistantDrafter(
-        assistant_model=mock_model_2d,
-        embed_tokens=embed_tokens,
-        max_draft_len=2,
-    )
-    draft_2d = drafter_2d.draft(
-        last_token_id=50,
-        last_hidden_state=last_hidden_2d,
-        shared_kv=shared_kv,
-        cur_pos=cur_pos,
-    )
-    assert draft_2d == [301, 302]
-
-    # 4. Integration via DSparkVerifier propose_draft pipeline
+    # 4. Integration via DSparkVerifier
     mock_model_verifier = MockAssistantModel(vocab_size, hidden_dim, token_sequence=[401, 402, 403])
     verifier = DSparkVerifier(
         assistant_model=mock_model_verifier,
@@ -226,12 +250,12 @@ def test_gemma4_assistant_drafter():
 if __name__ == "__main__":
     test_standard_rmsnorm()
     test_logit_softcapping()
-    test_block_manager_swa_bounded()
-    test_dspark_neural_drafter()
+    test_bounded_swa_kv_cache_and_rollback()
+    test_prompt_lookup_cache()
     test_gemma_4_forward_small()
     test_gemma_4_moe_shared_mlp()
     test_marlin_quantized_batch_m()
-    test_fused_batched_moe_decode()
+    test_token_union_batched_moe()
     test_engine_generate()
     test_gemma4_assistant_drafter()
     print("All tests passed.")

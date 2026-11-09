@@ -14,17 +14,6 @@ void launch_gemma_softcapping(
     float cap
 );
 
-void launch_paged_swa_decode(
-    const torch::Tensor& q,
-    const torch::Tensor& k_cache,
-    const torch::Tensor& v_cache,
-    const torch::Tensor& block_tables,
-    const torch::Tensor& seq_lens,
-    torch::Tensor& out,
-    int sliding_window,
-    float scale
-);
-
 void launch_marlin_w4a16(
     const torch::Tensor& A,
     const torch::Tensor& B_packed,
@@ -165,34 +154,41 @@ void cpu_fused_batched_moe(
     torch::Tensor& out,
     int group_size
 ) {
-    int top_k = expert_indices.size(0);
+    int M = x.size(0);
+    int K = x.size(1);
     int two_I = gate_up_packed.size(2);
     int I = two_I / 2;
-    int K = x.size(1);
+    int total_slots = expert_indices.numel();
+    int top_k = total_slots / M;
 
-    auto idx_acc = expert_indices.to(torch::kInt64);
-    auto w_acc = expert_weights.to(torch::kFloat32);
+    auto idx_flat = expert_indices.reshape({-1}).to(torch::kInt64);
+    auto w_flat = expert_weights.reshape({-1}).to(torch::kFloat32);
 
-    for (int k = 0; k < top_k; ++k) {
-        int64_t e = idx_acc[k].item<int64_t>();
-        float w = w_acc[k].item<float>();
+    for (int m = 0; m < M; ++m) {
+        auto x_m = x.slice(0, m, m + 1);
+        auto out_m = out.slice(0, m, m + 1);
+        for (int k = 0; k < top_k; ++k) {
+            int slot = m * top_k + k;
+            int64_t e = idx_flat[slot].item<int64_t>();
+            float w = w_flat[slot].item<float>();
 
-        auto p_gu = gate_up_packed[e];
-        auto s_gu = gate_up_scales[e];
-        auto p_d = down_packed[e];
-        auto s_d = down_scales[e];
+            auto p_gu = gate_up_packed[e];
+            auto s_gu = gate_up_scales[e];
+            auto p_d = down_packed[e];
+            auto s_d = down_scales[e];
 
-        auto gu = torch::zeros({1, two_I}, x.options());
-        cpu_marlin_w4a16(x, p_gu, s_gu, gu, group_size);
+            auto gu = torch::zeros({1, two_I}, x.options());
+            cpu_marlin_w4a16(x_m, p_gu, s_gu, gu, group_size);
 
-        auto gate = gu.slice(1, 0, I);
-        auto up = gu.slice(1, I, two_I);
-        auto act = torch::gelu(gate, "tanh") * up;
+            auto gate = gu.slice(1, 0, I);
+            auto up = gu.slice(1, I, two_I);
+            auto act = torch::gelu(gate, "tanh") * up;
 
-        auto expert_out = torch::zeros({1, K}, x.options());
-        cpu_marlin_w4a16(act, p_d, s_d, expert_out, group_size);
+            auto expert_out = torch::zeros({1, K}, x.options());
+            cpu_marlin_w4a16(act, p_d, s_d, expert_out, group_size);
 
-        out.add_(expert_out, w);
+            out_m.add_(expert_out, w);
+        }
     }
 }
 
@@ -222,29 +218,9 @@ void fused_batched_moe_dispatch(
     );
 }
 
-void paged_swa_decode_dispatch(
-    const torch::Tensor& q,
-    const torch::Tensor& k_cache,
-    const torch::Tensor& v_cache,
-    const torch::Tensor& block_tables,
-    const torch::Tensor& seq_lens,
-    torch::Tensor& out,
-    int sliding_window,
-    float scale
-) {
-#ifdef USE_CUDA
-    if (q.is_cuda()) {
-        launch_paged_swa_decode(q, k_cache, v_cache, block_tables, seq_lens, out, sliding_window, scale);
-        return;
-    }
-#endif
-    TORCH_CHECK(false, "paged_swa_decode is only implemented for CUDA tensors");
-}
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm", &rmsnorm_dispatch);
     m.def("softcapping", &softcapping_dispatch);
     m.def("marlin_w4a16", &marlin_w4a16_dispatch);
     m.def("fused_batched_moe", &fused_batched_moe_dispatch);
-    m.def("paged_swa_decode", &paged_swa_decode_dispatch);
 }

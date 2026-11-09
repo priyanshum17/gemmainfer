@@ -7,7 +7,7 @@ from gemmainfer.models.config import GemmaConfig
 from gemmainfer.kernels.norm import GemmaRMSNorm
 from gemmainfer.kernels.activations import GemmaMLP, apply_logit_softcapping
 from gemmainfer.kernels.attention import GemmaAttention
-from gemmainfer.kernels.quant import marlin_forward
+from gemmainfer.kernels.quant import MarlinLinear, marlin_forward
 
 try:
     import gemmainfer_csrc
@@ -17,7 +17,7 @@ except ImportError:
 
 
 class GemmaBatchedMoE(nn.Module):
-    """Batched Mixture of Experts module with router gating and optional Marlin W4A16 quantization."""
+    """Batched Mixture of Experts module with Token-Union W4A16 coalesced execution."""
 
     def __init__(self, config: GemmaConfig):
         super().__init__()
@@ -67,9 +67,9 @@ class GemmaBatchedMoE(nn.Module):
             nn.init.normal_(self.down_proj, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Route tokens to top-k experts and accumulate weighted outputs."""
+        """Route tokens to top-k experts and execute Token-Union coalesced expert projections."""
         orig_shape = x.shape
-        x_flat = x.view(-1, self.hidden_size)
+        x_flat = x.view(-1, self.hidden_size).contiguous()
         num_tokens = x_flat.shape[0]
 
         x_normed = self.router_norm(x_flat) * self.router_scale * (self.hidden_size ** -0.5)
@@ -82,83 +82,79 @@ class GemmaBatchedMoE(nn.Module):
         weights = (weights * scales).type_as(x)
 
         out = torch.zeros_like(x_flat)
-        is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
         if self.quant_method == "w4a16":
-            if _HAS_CSRC and hasattr(gemmainfer_csrc, "fused_batched_moe") and not is_capturing and num_tokens <= 16:
-                for t in range(num_tokens):
-                    out_t = out[t : t + 1]
-                    gemmainfer_csrc.fused_batched_moe(
-                        x_flat[t : t + 1],
-                        self.gate_up_packed,
-                        self.gate_up_scales,
-                        self.down_packed,
-                        self.down_scales,
-                        indices[t],
-                        weights[t],
-                        out_t,
-                        self.gu_group_size,
-                    )
+            if _HAS_CSRC and hasattr(gemmainfer_csrc, "fused_batched_moe") and num_tokens <= 16:
+                # Single C++/CUDA call across all num_tokens with Token-Union expert deduplication
+                gemmainfer_csrc.fused_batched_moe(
+                    x_flat,
+                    self.gate_up_packed,
+                    self.gate_up_scales,
+                    self.down_packed,
+                    self.down_scales,
+                    indices.to(torch.int32),
+                    weights,
+                    out,
+                    self.gu_group_size,
+                )
                 return out.view(orig_shape)
 
-            for k in range(self.top_k):
-                e_idx = indices[:, k]
-                w = weights[:, k : k + 1]
-                p_gu = self.gate_up_packed[e_idx]
-                s_gu = self.gate_up_scales[e_idx]
-                p_d = self.down_packed[e_idx]
-                s_d = self.down_scales[e_idx]
+            # Fallback for large prefill batches (num_tokens > 16) or when C++ extension is unavailable:
+            # Group by unique active expert so each touched expert is dequantized only once.
+            flat_indices = indices.view(-1)
+            token_indices = (
+                torch.arange(num_tokens, device=x.device)
+                .unsqueeze(1)
+                .expand(-1, self.top_k)
+                .reshape(-1)
+            )
+            weights_flat = weights.view(-1, 1)
 
-                if num_tokens == 1:
-                    gu = marlin_forward(x_flat, p_gu.squeeze(0), s_gu.squeeze(0), self.gu_group_size, 2 * self.moe_intermediate_size)
-                    gate, up = gu.chunk(2, dim=-1)
-                    act = F.gelu(gate, approximate="tanh") * up
-                    expert_out = marlin_forward(act, p_d.squeeze(0), s_d.squeeze(0), self.d_group_size, self.hidden_size)
-                    out = out + expert_out * w
-                else:
-                    for t in range(num_tokens):
-                        tok_x = x_flat[t : t + 1]
-                        gu = marlin_forward(tok_x, p_gu[t], s_gu[t], self.gu_group_size, 2 * self.moe_intermediate_size)
-                        gate, up = gu.chunk(2, dim=-1)
-                        act = F.gelu(gate, approximate="tanh") * up
-                        expert_out = marlin_forward(act, p_d[t], s_d[t], self.d_group_size, self.hidden_size)
-                        out[t : t + 1] = out[t : t + 1] + expert_out * w[t : t + 1]
-            return out.view(orig_shape)
+            for e_idx in torch.unique(flat_indices).tolist():
+                mask = flat_indices == e_idx
+                active_tokens = token_indices[mask]
+                expert_in = x_flat[active_tokens]
 
-        if num_tokens <= 64 or is_capturing:
-            for k in range(self.top_k):
-                e_idx = indices[:, k]
-                w = weights[:, k : k + 1]
-                w_gu = self.gate_up_proj[e_idx]
-                gu = torch.bmm(x_flat.unsqueeze(1), w_gu).squeeze(1)
+                gu = marlin_forward(
+                    expert_in,
+                    self.gate_up_packed[e_idx],
+                    self.gate_up_scales[e_idx],
+                    self.gu_group_size,
+                    2 * self.moe_intermediate_size,
+                )
                 gate, up = gu.chunk(2, dim=-1)
                 act = F.gelu(gate, approximate="tanh") * up
-                w_d = self.down_proj[e_idx]
-                expert_out = torch.bmm(act.unsqueeze(1), w_d).squeeze(1)
-                out = out + expert_out * w
+                expert_out = marlin_forward(
+                    act,
+                    self.down_packed[e_idx],
+                    self.down_scales[e_idx],
+                    self.d_group_size,
+                    self.hidden_size,
+                )
+                out.index_add_(0, active_tokens, expert_out * weights_flat[mask])
+
             return out.view(orig_shape)
 
+        # Unquantized path
         flat_indices = indices.view(-1)
-        token_indices = torch.arange(num_tokens, device=x.device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)
+        token_indices = (
+            torch.arange(num_tokens, device=x.device)
+            .unsqueeze(1)
+            .expand(-1, self.top_k)
+            .reshape(-1)
+        )
         weights_flat = weights.view(-1, 1)
 
-        for e_idx in range(self.num_experts):
-            mask = (flat_indices == e_idx)
-            if not mask.any():
-                continue
+        for e_idx in torch.unique(flat_indices).tolist():
+            mask = flat_indices == e_idx
             active_tokens = token_indices[mask]
             expert_in = x_flat[active_tokens]
 
-            w_gu = self.gate_up_proj[e_idx]
-            gu = torch.matmul(expert_in, w_gu)
+            gu = torch.matmul(expert_in, self.gate_up_proj[e_idx])
             gate, up = gu.chunk(2, dim=-1)
             act = F.gelu(gate, approximate="tanh") * up
-
-            w_d = self.down_proj[e_idx]
-            expert_out = torch.matmul(act, w_d)
-
-            expert_weights = weights_flat[mask]
-            out.index_add_(0, active_tokens, expert_out * expert_weights)
+            expert_out = torch.matmul(act, self.down_proj[e_idx])
+            out.index_add_(0, active_tokens, expert_out * weights_flat[mask])
 
         return out.view(orig_shape)
 
@@ -197,9 +193,9 @@ class GemmaDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache: Optional[Tuple] = None,
         mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[Tuple]]:
         """Execute decoder layer forward pass returning hidden states and updated KV cache."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -244,27 +240,58 @@ class GemmaForCausalLM(nn.Module):
             for i in range(config.num_hidden_layers)
         ])
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, add_unit_offset=config.add_unit_offset)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.lm_head.weight = self.embed_tokens.weight
+        if config.quant_method == "w4a16" and config.hidden_size % config.quant_group_size == 0 and config.hidden_size % 8 == 0:
+            dtype = getattr(torch, config.dtype, torch.bfloat16)
+            self.lm_head = MarlinLinear(
+                config.hidden_size,
+                config.vocab_size,
+                group_size=config.quant_group_size,
+                bias=False,
+                dtype=dtype,
+            )
+        else:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.lm_head.weight = self.embed_tokens.weight
 
-    def init_kv_cache(self, batch_size: int = 1, max_seq_len: int = 4096, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
-        """Pre-allocate static key-value cache buffers across all decoder layers."""
+    def init_kv_cache(
+        self,
+        batch_size: int = 1,
+        max_seq_len: int = 4096,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        """Allocate speculation-safe bounded SWA buffers and full-attention KV caches."""
         device = device or self.embed_tokens.weight.device
         dtype = dtype or self.embed_tokens.weight.dtype
         cache = []
         for layer in self.layers:
             attn = layer.self_attn
-            k_buf = torch.zeros((batch_size, attn.num_key_value_heads, max_seq_len, attn.head_dim), device=device, dtype=dtype)
-            v_buf = torch.zeros((batch_size, attn.num_key_value_heads, max_seq_len, attn.head_dim), device=device, dtype=dtype)
-            cur_len = [0]
-            cache.append((k_buf, v_buf, cur_len))
+            if attn.sliding_window is not None:
+                # Bounded SWA capacity with 64-token headroom for speculative verification & rollback
+                layer_cap = min(max_seq_len, attn.sliding_window + 64)
+            else:
+                layer_cap = max_seq_len
+
+            k_buf = torch.zeros(
+                (batch_size, attn.num_key_value_heads, layer_cap, attn.head_dim),
+                device=device,
+                dtype=dtype,
+            )
+            v_buf = torch.zeros(
+                (batch_size, attn.num_key_value_heads, layer_cap, attn.head_dim),
+                device=device,
+                dtype=dtype,
+            )
+            # meta = [logical_seq_len, physical_buf_pos]
+            meta = [0, 0]
+            cache.append((k_buf, v_buf, meta))
         return cache
 
     def forward(
         self,
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        past_key_values: Optional[List[Tuple]] = None,
         return_logits_only_last: bool = True,
         return_hidden_states: bool = False,
     ):
@@ -298,9 +325,9 @@ class GemmaForCausalLM(nn.Module):
         last_hidden = hidden_states[:, -1:, :] if return_logits_only_last else hidden_states
 
         if return_logits_only_last:
-            hidden_states = hidden_states[:, -1:, :]
-
-        logits = self.lm_head(hidden_states)
+            logits = self.lm_head(last_hidden)
+        else:
+            logits = self.lm_head(hidden_states)
 
         if self.config.final_logit_softcapping is not None:
             logits = apply_logit_softcapping(logits, self.config.final_logit_softcapping)

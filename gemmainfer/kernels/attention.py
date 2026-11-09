@@ -75,7 +75,7 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, si
 
 
 class GemmaAttention(nn.Module):
-    """Multi-head attention supporting sliding window attention, global attention, and GQA."""
+    """Multi-head attention with speculation-safe bounded SWA ring-compaction, global K=V, and GQA."""
 
     def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
@@ -127,10 +127,10 @@ class GemmaAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache: Optional[Tuple] = None,
         mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        """Compute self-attention output states and updated KV cache."""
+    ) -> Tuple[torch.Tensor, Optional[Tuple]]:
+        """Compute self-attention output states and update bounded SWA or global KV cache."""
         bsz, q_len, _ = hidden_states.size()
 
         q = self.q_proj(hidden_states)
@@ -145,19 +145,49 @@ class GemmaAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = self.v_norm(v).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(v)
+        max_pos = int(position_ids.max().item()) + 1 if position_ids.numel() > 0 else q_len
+        cos, sin = self.rotary_emb(v, seq_len=max_pos)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
         if kv_cache is not None:
             if isinstance(kv_cache, tuple) and len(kv_cache) == 3:
-                k_buf, v_buf, cur_len = kv_cache
-                pos = cur_len[0]
-                k_buf[:, :, pos : pos + q_len, :].copy_(k)
-                v_buf[:, :, pos : pos + q_len, :].copy_(v)
-                cur_len[0] += q_len
-                k = k_buf[:, :, : cur_len[0], :]
-                v = v_buf[:, :, : cur_len[0], :]
-                new_kv_cache = (k_buf, v_buf, cur_len)
+                k_buf, v_buf, meta = kv_cache
+                if len(meta) == 1:
+                    meta.append(meta[0])
+                logical_pos, buf_pos = meta[0], meta[1]
+                buf_cap = k_buf.size(2)
+
+                if q_len > buf_cap:
+                    # Prefill exceeds bounded SWA buffer capacity: attend over full prefill k, v,
+                    # and retain the trailing sliding_window tokens in the buffer.
+                    keep = min(q_len, self.sliding_window or buf_cap, buf_cap)
+                    k_buf[:, :, :keep, :].copy_(k[:, :, -keep:, :])
+                    v_buf[:, :, :keep, :].copy_(v[:, :, -keep:, :])
+                    meta[0] = logical_pos + q_len
+                    meta[1] = keep
+                    new_kv_cache = (k_buf, v_buf, meta)
+                else:
+                    if buf_pos + q_len > buf_cap:
+                        # Speculation-safe window compaction: slide active window to start of buffer,
+                        # preserving headroom for speculative verification & rollback.
+                        win = self.sliding_window or (buf_cap - q_len)
+                        keep = min(buf_pos, max(win - 1, 1), buf_cap - q_len)
+                        if keep > 0:
+                            k_buf_tmp = k_buf[:, :, buf_pos - keep : buf_pos, :].clone()
+                            v_buf_tmp = v_buf[:, :, buf_pos - keep : buf_pos, :].clone()
+                            k_buf[:, :, :keep, :].copy_(k_buf_tmp)
+                            v_buf[:, :, :keep, :].copy_(v_buf_tmp)
+                        buf_pos = keep
+
+                    k_buf[:, :, buf_pos : buf_pos + q_len, :].copy_(k)
+                    v_buf[:, :, buf_pos : buf_pos + q_len, :].copy_(v)
+                    buf_pos += q_len
+                    logical_pos += q_len
+                    meta[0] = logical_pos
+                    meta[1] = buf_pos
+                    k = k_buf[:, :, :buf_pos, :]
+                    v = v_buf[:, :, :buf_pos, :]
+                    new_kv_cache = (k_buf, v_buf, meta)
             else:
                 k_prev, v_prev = kv_cache
                 k = torch.cat([k_prev, k], dim=2)
@@ -186,28 +216,49 @@ class GemmaAttention(nn.Module):
             output = output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
             return self.o_proj(output), new_kv_cache
 
-        if self.num_key_value_groups > 1:
-            k_expanded = k.repeat_interleave(self.num_key_value_groups, dim=1)
-            v_expanded = v.repeat_interleave(self.num_key_value_groups, dim=1)
+        # Multi-token verification or prefill (q_len > 1)
+        if self.sliding_window is not None and k.size(2) > self.sliding_window + q_len:
+            win_span = self.sliding_window + q_len
+            k_attn = k[:, :, -win_span:, :]
+            v_attn = v[:, :, -win_span:, :]
         else:
-            k_expanded, v_expanded = k, v
+            k_attn, v_attn = k, v
 
-        total_k_len = k_expanded.size(2)
-        q = q * self.scaling
-        attn_weights = torch.matmul(q, k_expanded.transpose(-1, -2))
-
-        if mask is not None:
-            attn_weights = attn_weights + mask
-        elif q_len > 1:
+        total_k_len = k_attn.size(2)
+        attn_mask = mask
+        if attn_mask is None and q_len > 1:
             causal_diag = total_k_len - q_len + 1
-            causal_mask = torch.triu(torch.full((q_len, total_k_len), float("-inf"), device=q.device), diagonal=causal_diag)
+            attn_mask = torch.triu(
+                torch.full((q_len, total_k_len), float("-inf"), device=q.device, dtype=q.dtype),
+                diagonal=causal_diag,
+            )
             if self.sliding_window is not None:
                 window_diag = total_k_len - q_len - self.sliding_window
-                window_mask = torch.tril(torch.full((q_len, total_k_len), float("-inf"), device=q.device), diagonal=window_diag)
-                causal_mask = causal_mask + window_mask
-            attn_weights = attn_weights + causal_mask.unsqueeze(0).unsqueeze(0)
+                window_mask = torch.tril(
+                    torch.full((q_len, total_k_len), float("-inf"), device=q.device, dtype=q.dtype),
+                    diagonal=window_diag,
+                )
+                attn_mask = attn_mask + window_mask
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
 
-        attn_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(q)
-        output = torch.matmul(attn_probs, v_expanded)
+        try:
+            output = F.scaled_dot_product_attention(
+                q,
+                k_attn,
+                v_attn,
+                attn_mask=attn_mask,
+                scale=self.scaling,
+                enable_gqa=(self.num_key_value_groups > 1),
+            )
+        except TypeError:
+            if self.num_key_value_groups > 1:
+                k_exp = k_attn.repeat_interleave(self.num_key_value_groups, dim=1)
+                v_exp = v_attn.repeat_interleave(self.num_key_value_groups, dim=1)
+            else:
+                k_exp, v_exp = k_attn, v_attn
+            output = F.scaled_dot_product_attention(
+                q, k_exp, v_exp, attn_mask=attn_mask, scale=self.scaling
+            )
+
         output = output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
         return self.o_proj(output), new_kv_cache
