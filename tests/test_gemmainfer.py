@@ -191,11 +191,11 @@ def test_gemma4_assistant_drafter():
 
     assert draft == [101, 102, 103]
     assert mock_model.call_count == 3
-    assert mock_model.received_position_ids == [4, 5, 6]
+    assert mock_model.received_position_ids == [5, 5, 5]
     assert mock_model.received_kv_shapes[0] == torch.Size([1, 2, 5, 32])
 
-    # 2. Teacher-forced bonus token drafting (single-pass speculative mode)
-    mock_model_tf = MockAssistantModel(vocab_size, hidden_dim, token_sequence=[499, 201, 202, 203])
+    # 2. Bonus token drafting (single-pass speculative mode)
+    mock_model_tf = MockAssistantModel(vocab_size, hidden_dim, token_sequence=[201, 202, 203])
     drafter_tf = Gemma4AssistantDrafter(
         assistant_model=mock_model_tf,
         embed_tokens=embed_tokens,
@@ -209,8 +209,8 @@ def test_gemma4_assistant_drafter():
         forced_first_token=77,
     )
     assert draft_tf == [201, 202, 203]
-    assert mock_model_tf.call_count == 4
-    assert mock_model_tf.received_position_ids == [4, 5, 6, 7]
+    assert mock_model_tf.call_count == 3
+    assert mock_model_tf.received_position_ids == [5, 5, 5]
 
     # 3. Early termination on EOS token (token 1)
     mock_model_eos = MockAssistantModel(vocab_size, hidden_dim, token_sequence=[201, 1, 203])

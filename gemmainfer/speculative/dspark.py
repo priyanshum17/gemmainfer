@@ -4,7 +4,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import gemmainfer_csrc
+    _HAS_CSRC = True
+except ImportError:
+    _HAS_CSRC = False
+
 logger = logging.getLogger("gemmainfer")
+
+_EMPTY_TENSOR = torch.empty(0)
+
+
+def _patch_assistant_rmsnorm(assistant_model: nn.Module) -> None:
+    """Replace slow Python RMSNorm forward methods in HF assistant model with fused CUDA kernel."""
+    if not _HAS_CSRC or not hasattr(gemmainfer_csrc, "rmsnorm"):
+        return
+
+    for mod in assistant_model.modules():
+        cls_name = mod.__class__.__name__
+        if "RMSNorm" in cls_name:
+            eps = getattr(mod, "eps", 1e-6)
+            weight = getattr(mod, "weight", None)
+            with_scale = getattr(mod, "with_scale", weight is not None)
+
+            def _make_fast_rmsnorm(w, epsilon, has_s):
+                def _fast_forward(x: torch.Tensor) -> torch.Tensor:
+                    if not x.is_cuda:
+                        in_f = x.float()
+                        normed = (in_f * torch.rsqrt(in_f.pow(2).mean(-1, keepdim=True) + epsilon)).type_as(x)
+                        return normed * w if (has_s and w is not None) else normed
+                    x_c = x if x.is_contiguous() else x.contiguous()
+                    out = torch.empty_like(x_c)
+                    w_arg = w if (has_s and w is not None and w.is_contiguous()) else _EMPTY_TENSOR
+                    gemmainfer_csrc.rmsnorm(x_c, w_arg, out, epsilon, False)
+                    return out
+                return _fast_forward
+
+            mod.forward = _make_fast_rmsnorm(weight, eps, with_scale)
 
 
 class PromptLookupCache:
@@ -34,7 +70,7 @@ class Gemma4AssistantDrafter:
     """
     Drafter utilizing Google's official companion assistant model
     (google/gemma-4-26B-A4B-it-assistant) with shared KV states,
-    teacher-forced bonus token synchronization, and confidence-gated stopping.
+    fused CUDA RMSNorm/RoPE acceleration, and zero-sync GPU drafting.
     """
 
     def __init__(
@@ -48,6 +84,16 @@ class Gemma4AssistantDrafter:
         self.embed_tokens = embed_tokens
         self.max_draft_len = max_draft_len
         self.confidence_threshold = confidence_threshold
+        if isinstance(assistant_model, nn.Module):
+            _patch_assistant_rmsnorm(assistant_model)
+        self._has_direct_layers = (
+            hasattr(assistant_model, "pre_projection")
+            and hasattr(assistant_model, "post_projection")
+            and hasattr(assistant_model, "lm_head")
+            and hasattr(assistant_model, "model")
+            and hasattr(assistant_model.model, "layers")
+            and hasattr(assistant_model.model, "rotary_emb")
+        )
 
     @torch.inference_mode()
     def draft(
@@ -60,72 +106,35 @@ class Gemma4AssistantDrafter:
     ) -> List[int]:
         """Propose draft tokens using companion model and shared KV states."""
         device = last_hidden_state.device
-        curr_token = torch.tensor([[last_token_id]], dtype=torch.long, device=device)
+        # Use forced_first_token (the newly sampled bonus_tok at cur_pos) when provided,
+        # otherwise use last_token_id.
+        start_tok = forced_first_token if forced_first_token is not None else last_token_id
+        curr_token = torch.tensor([[start_tok]], dtype=torch.long, device=device)
+
         curr_h = last_hidden_state
         if curr_h.dim() == 2:
             curr_h = curr_h.unsqueeze(1)
         elif curr_h.shape[1] > 1:
             curr_h = curr_h[:, -1:, :]
 
-        # Crop shared KV states up to cur_pos when buffer exceeds cur_pos
-        cropped_kv = {
-            k: (
-                v[0][:, :, :cur_pos, :] if v[0].size(2) > cur_pos else v[0],
-                v[1][:, :, :cur_pos, :] if v[1].size(2) > cur_pos else v[1],
-            )
-            for k, v in shared_kv.items()
-        }
+        # Crop shared KV states up to cur_pos (the validated target KV cache length)
+        cropped_kv = {}
+        for k, v in shared_kv.items():
+            k_t = v[0][:, :, :cur_pos, :] if v[0].size(2) > cur_pos else v[0]
+            v_t = v[1][:, :, :cur_pos, :] if v[1].size(2) > cur_pos else v[1]
+            if k == "sliding_attention" and k_t.size(2) > 1024:
+                k_t = k_t[:, :, -1024:, :]
+                v_t = v_t[:, :, -1024:, :]
+            cropped_kv[k] = (k_t, v_t)
+
+        embed_scale = self.embed_tokens.weight.shape[-1] ** 0.5
+        pos_ids = torch.tensor([[cur_pos]], dtype=torch.long, device=device)
+
+        if self._has_direct_layers and curr_h.is_cuda:
+            return self._draft_direct_cuda(curr_token, curr_h, cropped_kv, pos_ids, embed_scale)
 
         drafted_tokens: List[int] = []
-        embed_scale = self.embed_tokens.weight.shape[-1] ** 0.5
-
-        if forced_first_token is not None:
-            # Teacher-forced step 0: synchronize assistant hidden state at (cur_pos - 1)
-            # using the already-verified token (last_token_id) and its target hidden state,
-            # then feed the already-known target prediction (forced_first_token) into step 1.
-            pos_0 = torch.tensor([[cur_pos - 1]], dtype=torch.long, device=device)
-            token_emb_0 = self.embed_tokens(curr_token) * embed_scale
-            inputs_embeds_0 = torch.cat([token_emb_0, curr_h], dim=-1)
-            out_0 = self.assistant(
-                inputs_embeds=inputs_embeds_0,
-                position_ids=pos_0,
-                shared_kv_states=cropped_kv,
-                use_cache=False,
-            )
-            curr_token = torch.tensor([[forced_first_token]], dtype=torch.long, device=device)
-            curr_h = out_0.last_hidden_state[:, -1:, :]
-            cum_conf = 1.0
-
-            for step in range(1, self.max_draft_len + 1):
-                pos_ids = torch.tensor([[cur_pos - 1 + step]], dtype=torch.long, device=device)
-                token_emb = self.embed_tokens(curr_token) * embed_scale
-                inputs_embeds = torch.cat([token_emb, curr_h], dim=-1)
-
-                out = self.assistant(
-                    inputs_embeds=inputs_embeds,
-                    position_ids=pos_ids,
-                    shared_kv_states=cropped_kv,
-                    use_cache=False,
-                )
-
-                step_logits = out.logits[:, -1, :]
-                probs = F.softmax(step_logits, dim=-1, dtype=torch.float32)
-                max_prob, next_token = torch.max(probs, dim=-1, keepdim=True)
-                tok_val = next_token.item()
-                cum_conf *= max_prob.item()
-
-                drafted_tokens.append(tok_val)
-                if tok_val in (1, 106) or (len(drafted_tokens) >= 2 and cum_conf < self.confidence_threshold):
-                    break
-
-                curr_token = next_token
-                curr_h = out.last_hidden_state[:, -1:, :]
-
-            return drafted_tokens
-
-        # Standalone mode (when forced_first_token is None)
-        for step in range(self.max_draft_len):
-            pos_ids = torch.tensor([[cur_pos - 1 + step]], dtype=torch.long, device=device)
+        for _ in range(self.max_draft_len):
             token_emb = self.embed_tokens(curr_token) * embed_scale
             inputs_embeds = torch.cat([token_emb, curr_h], dim=-1)
 
@@ -147,6 +156,85 @@ class Gemma4AssistantDrafter:
             curr_h = out.last_hidden_state[:, -1:, :]
 
         return drafted_tokens
+
+    def _draft_direct_cuda(
+        self,
+        curr_token: torch.Tensor,
+        curr_h: torch.Tensor,
+        cropped_kv: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+        pos_ids: torch.Tensor,
+        embed_scale: float,
+    ) -> List[int]:
+        """Zero-sync direct CUDA execution of Gemma4AssistantForCausalLM layers."""
+        asst = self.assistant
+        m = asst.model
+        device = curr_h.device
+        zero_pos = torch.zeros((1, 1), dtype=torch.long, device=device)
+
+        # Precompute rotary embeddings ONCE for constant pos_ids across all draft steps
+        pe_cache = {}
+        for lt in m.unique_layer_types:
+            cos, sin = m.rotary_emb(curr_h, pos_ids, lt)
+            pe_cache[lt] = (cos.squeeze(0).contiguous(), sin.squeeze(0).contiguous())
+
+        use_fused_rope = _HAS_CSRC and hasattr(gemmainfer_csrc, "fused_rope_inplace")
+        drafted_tensors: List[torch.Tensor] = []
+
+        for step in range(self.max_draft_len):
+            token_emb = self.embed_tokens(curr_token) * embed_scale
+            inputs_embeds = torch.cat([token_emb, curr_h], dim=-1)
+            h = asst.pre_projection(inputs_embeds)
+
+            for i, layer in enumerate(m.layers):
+                lt = m.config.layer_types[i]
+                cos_2d, sin_2d = pe_cache[lt]
+                res = h
+                h_norm = layer.input_layernorm(h)
+                attn = layer.self_attn
+                q = attn.q_proj(h_norm).view(1, 1, -1, attn.head_dim)
+                q = attn.q_norm(q).transpose(1, 2)
+
+                if use_fused_rope:
+                    gemmainfer_csrc.fused_rope_inplace(q, _EMPTY_TENSOR, cos_2d, sin_2d, zero_pos)
+                else:
+                    half_d = attn.head_dim // 2
+                    q1, q2 = q[..., :half_d], q[..., half_d:]
+                    c = cos_2d.unsqueeze(0).unsqueeze(1)
+                    s = sin_2d.unsqueeze(0).unsqueeze(1)
+                    q = (q * c) + (torch.cat((-q2, q1), dim=-1) * s)
+
+                k_shared, v_shared = cropped_kv[lt]
+                attn_out = F.scaled_dot_product_attention(
+                    q, k_shared, v_shared, scale=attn.scaling, enable_gqa=True
+                )
+                attn_out = attn_out.transpose(1, 2).reshape(1, 1, -1)
+                h = res + layer.post_attention_layernorm(attn.o_proj(attn_out))
+
+                res = h
+                h = res + layer.post_feedforward_layernorm(layer.mlp(layer.pre_feedforward_layernorm(h)))
+                h = h * layer.layer_scalar
+
+            h = m.norm(h)
+            if getattr(asst.config, "use_ordered_embeddings", False) and asst.masked_embedding is not None:
+                logits = asst.masked_embedding(h, asst.lm_head.weight)
+            else:
+                logits = asst.lm_head(h)
+
+            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            drafted_tensors.append(next_token)
+
+            if step + 1 < self.max_draft_len:
+                curr_token = next_token
+                curr_h = asst.post_projection(h)
+
+        # Single GPU->CPU sync for all drafted tokens at once
+        all_drafted = torch.cat(drafted_tensors, dim=1)[0].tolist()
+        trimmed: List[int] = []
+        for tok_val in all_drafted:
+            trimmed.append(tok_val)
+            if tok_val in (1, 106):
+                break
+        return trimmed
 
 
 class DSparkVerifier:
@@ -189,7 +277,7 @@ class DSparkVerifier:
             and shared_kv is not None
             and cur_pos is not None
         ):
-            last_tok = tokens[-2] if (forced_first_token is not None and len(tokens) >= 2) else tokens[-1]
+            last_tok = forced_first_token if forced_first_token is not None else tokens[-1]
             draft = self.assistant_drafter.draft(
                 last_token_id=last_tok,
                 last_hidden_state=last_hidden_state,

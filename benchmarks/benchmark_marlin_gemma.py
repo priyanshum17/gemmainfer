@@ -10,7 +10,6 @@ def run_benchmark():
 
     # Gemma 4 26B A4B exact specifications: 25.23B total parameters, 3.82B active per token
     total_params = 25.23e9
-    active_params = 3.82e9
 
     fp16_gb = (total_params * 2) / (1024**3)
     w4a16_gb = (total_params * (0.5 + 2.0 / 128)) / (1024**3)

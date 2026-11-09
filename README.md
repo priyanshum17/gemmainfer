@@ -22,17 +22,18 @@ flowchart LR
 
 ## Performance Benchmarks (RTX 3090 24GB)
 
-Live endpoint benchmark on NVIDIA GeForce RTX 3090 (24GB VRAM, PCIe 4.0, CUDA 13.0) generating 60 completion tokens:
+Live benchmark on NVIDIA GeForce RTX 3090 (24GB VRAM, PCIe 4.0, CUDA 13.2) generating 64 completion tokens:
 
-| Engine | Quantization / Method | Single-Stream Decode Speed | Latency (60 Tokens) | Speedup vs Baseline |
-| :--- | :--- | :--- | :--- | :--- |
-| **GemmaInfer (Speculative MTP)** | **W4A16 + Companion Drafter** | **38.69 tok/s** | **2.21 s** | **4.8x faster** |
-| **GemmaInfer (Autoregressive)** | W4A16 Split-K Marlin | 27.42 tok/s | 3.12 s | 2.0x faster |
-| **`llama.cpp`** | GGUF Q4_K_M (`--flash-attn`) | 22.50 tok/s | 3.28 s | 1.6x faster |
-| **vLLM** | W4A16 / AWQ Triton MoE | 20.60 tok/s | 3.95 s | 1.5x faster |
-| *Original Baseline* | Naive Autoregressive W4A16 | 13.72 tok/s | 10.59 s | 1.0x (Reference) |
+| Engine | Quantization / Method | Single-Stream Decode Speed | Speedup vs Baseline |
+| :--- | :--- | :--- | :--- |
+| **GemmaInfer (Speculative MTP, $K=6$)** | **W4A16 Token-Union + Direct CUDA Drafter** | **79.22 tok/s** | **5.77x faster** |
+| **GemmaInfer (Adaptive Speculative MTP)** | **W4A16 Token-Union + Adaptive Drafter ($K=4\leftrightarrow 6$)** | **76.14 tok/s** | **5.55x faster** |
+| **GemmaInfer (Autoregressive)** | W4A16 Split-K + Fused RoPE/RMSNorm | **30.99 tok/s** | **2.26x faster** |
+| **`llama.cpp`** | GGUF Q4_K_M (`--flash-attn`) | 22.50 tok/s | 1.64x faster |
+| **vLLM** | W4A16 / AWQ Triton MoE | 20.60 tok/s | 1.50x faster |
+| *Original Baseline* | Naive Autoregressive W4A16 | 13.72 tok/s | 1.00x (Reference) |
 
-*GemmaInfer breaks through the physical 22.2 tok/s GDDR6X memory bandwidth roofline by drafting 3–5 tokens in SRAM and verifying candidates in a single batched target pass.*
+*GemmaInfer breaks through the physical GDDR6X single-token memory bandwidth roofline by drafting 4–6 tokens in ~2.9 ms/step with zero CPU-GPU sync and verifying all candidates in a single register-unrolled Token-Union target pass.*
 
 ---
 

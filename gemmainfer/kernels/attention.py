@@ -7,6 +7,12 @@ from gemmainfer.models.config import GemmaConfig
 from gemmainfer.kernels.norm import GemmaRMSNorm
 from gemmainfer.kernels.quant import MarlinLinear
 
+try:
+    import gemmainfer_csrc
+    _HAS_CSRC = True
+except ImportError:
+    _HAS_CSRC = False
+
 
 def _make_linear(in_features: int, out_features: int, bias: bool = False, quant_method: Optional[str] = None, group_size: int = 64) -> nn.Module:
     """Helper to instantiate standard or Marlin quantized Linear layer."""
@@ -67,6 +73,9 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embeddings to query and key states."""
+    if _HAS_CSRC and hasattr(gemmainfer_csrc, "fused_rope_inplace") and q.is_cuda:
+        gemmainfer_csrc.fused_rope_inplace(q, k, cos, sin, position_ids)
+        return q, k
     cos = cos[position_ids].unsqueeze(1)
     sin = sin[position_ids].unsqueeze(1)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -145,8 +154,17 @@ class GemmaAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = self.v_norm(v).transpose(1, 2)
 
-        max_pos = int(position_ids.max().item()) + 1 if position_ids.numel() > 0 else q_len
-        cos, sin = self.rotary_emb(v, seq_len=max_pos)
+        if kv_cache is not None:
+            if isinstance(kv_cache, tuple) and len(kv_cache) == 3:
+                req_seq_len = kv_cache[2][0] + q_len
+            else:
+                req_seq_len = kv_cache[0].size(2) + q_len
+        elif q_len <= self.rotary_emb.cos_cached.shape[0]:
+            req_seq_len = None
+        else:
+            req_seq_len = int(position_ids.max().item()) + 1 if position_ids.numel() > 0 else q_len
+
+        cos, sin = self.rotary_emb(v, seq_len=req_seq_len if (req_seq_len is not None and req_seq_len > self.rotary_emb.cos_cached.shape[0]) else None)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
         if kv_cache is not None:

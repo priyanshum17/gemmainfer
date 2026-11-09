@@ -9,6 +9,14 @@ void launch_gemma_rmsnorm(
     bool add_unit_offset
 );
 
+void launch_fused_rope_inplace(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin,
+    const torch::Tensor& position_ids
+);
+
 void launch_gemma_softcapping(
     torch::Tensor& logits,
     float cap
@@ -84,11 +92,39 @@ void cpu_gemma_rmsnorm(
     bool add_unit_offset
 ) {
     auto in_flat = input.view({-1, input.size(-1)}).to(torch::kFloat32);
-    auto w = weight.to(torch::kFloat32);
     auto mean_sq = torch::mean(in_flat * in_flat, -1, true);
     auto rsqrt_val = torch::rsqrt(mean_sq + eps);
-    auto scale = add_unit_offset ? (1.0f + w) : w;
-    output.copy_((in_flat * rsqrt_val * scale).view_as(output));
+    if (weight.defined() && weight.numel() > 0) {
+        auto w = weight.to(torch::kFloat32);
+        auto scale = add_unit_offset ? (1.0f + w) : w;
+        output.copy_((in_flat * rsqrt_val * scale).view_as(output));
+    } else {
+        output.copy_((in_flat * rsqrt_val).view_as(output));
+    }
+}
+
+void cpu_fused_rope_inplace(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin,
+    const torch::Tensor& position_ids
+) {
+    int half_D = q.size(-1) / 2;
+    auto c = cos.index({position_ids}).unsqueeze(1);
+    auto s = sin.index({position_ids}).unsqueeze(1);
+
+    auto q1 = q.slice(-1, 0, half_D);
+    auto q2 = q.slice(-1, half_D, q.size(-1));
+    auto q_rot = torch::cat({-q2, q1}, -1);
+    q.copy_(q * c + q_rot * s);
+
+    if (k.defined() && k.numel() > 0) {
+        auto k1 = k.slice(-1, 0, half_D);
+        auto k2 = k.slice(-1, half_D, k.size(-1));
+        auto k_rot = torch::cat({-k2, k1}, -1);
+        k.copy_(k * c + k_rot * s);
+    }
 }
 
 void cpu_gemma_softcapping(
@@ -112,6 +148,22 @@ void rmsnorm_dispatch(
     }
 #endif
     cpu_gemma_rmsnorm(input, weight, output, eps, add_unit_offset);
+}
+
+void fused_rope_inplace_dispatch(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin,
+    const torch::Tensor& position_ids
+) {
+#ifdef USE_CUDA
+    if (q.is_cuda()) {
+        launch_fused_rope_inplace(q, k, cos, sin, position_ids);
+        return;
+    }
+#endif
+    cpu_fused_rope_inplace(q, k, cos, sin, position_ids);
 }
 
 void softcapping_dispatch(
@@ -220,6 +272,7 @@ void fused_batched_moe_dispatch(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm", &rmsnorm_dispatch);
+    m.def("fused_rope_inplace", &fused_rope_inplace_dispatch);
     m.def("softcapping", &softcapping_dispatch);
     m.def("marlin_w4a16", &marlin_w4a16_dispatch);
     m.def("fused_batched_moe", &fused_batched_moe_dispatch);

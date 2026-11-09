@@ -72,12 +72,10 @@ class GemmaBatchedMoE(nn.Module):
         x_flat = x.view(-1, self.hidden_size).contiguous()
         num_tokens = x_flat.shape[0]
 
-        x_normed = self.router_norm(x_flat) * self.router_scale * (self.hidden_size ** -0.5)
+        x_normed = self.router_norm(x_flat) * (self.router_scale * (self.hidden_size ** -0.5))
         router_logits = self.gate(x_normed)
-        router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-
-        weights, indices = torch.topk(router_probs, self.top_k, dim=-1)
-        weights = weights / weights.sum(dim=-1, keepdim=True)
+        top_logits, indices = torch.topk(router_logits, self.top_k, dim=-1)
+        weights = F.softmax(top_logits, dim=-1, dtype=torch.float32)
         scales = self.expert_scale[indices]
         weights = (weights * scales).type_as(x)
 

@@ -112,10 +112,11 @@ download_models() {
     mkdir -p "${MODEL_DIR}"
     echo "[INFO] Installing huggingface_hub..."
     uv pip install -q "huggingface_hub[cli]"
+    echo "[INFO] Downloading GotoAI-Inc/gemma-4-26B-A4B-it-W4A16 base checkpoint..."
+    python -c "from huggingface_hub import snapshot_download; snapshot_download('GotoAI-Inc/gemma-4-26B-A4B-it-W4A16', local_dir='${BASE_MODEL}')"
     echo "[INFO] Downloading official Google Gemma companion assistant model..."
-    huggingface-cli download google/gemma-4-26B-A4B-it-assistant --local-dir "${ASSISTANT_MODEL}"
-    echo "[INFO] Companion assistant ready at ${ASSISTANT_MODEL}."
-    echo "[INFO] Place your base model checkpoint in: ${BASE_MODEL}"
+    python -c "from huggingface_hub import snapshot_download; snapshot_download('google/gemma-4-26B-A4B-it-assistant', local_dir='${ASSISTANT_MODEL}')"
+    echo "[INFO] Both models ready at ${BASE_MODEL} and ${ASSISTANT_MODEL}."
 }
 
 # 6. Action Selection

@@ -12,7 +12,8 @@ __device__ __forceinline__ float gelu_tanh(float x) {
 
 // Multi-row Split-K W4A16 kernel for M in [1, 8] (decode and speculative verification).
 // Reads packed 4-bit weights and scales from HBM ONCE across all M tokens.
-template <typename scalar_t, int MAX_M = 8>
+// Compile-time unrolled over MAX_M so all accumulators stay strictly in registers.
+template <typename scalar_t, int MAX_M>
 __global__ void marlin_w4a16_splitk_batched_kernel(
     const scalar_t* __restrict__ A,          // [M, K]
     const int32_t* __restrict__ B_packed,    // [K / 8, N]
@@ -81,20 +82,38 @@ __global__ void marlin_w4a16_splitk_batched_kernel(
                 int32_t w_raw = (packed_val >> (i * 4)) & 0x0F;
                 float weight_val = static_cast<float>(w_raw - 8);
 
-                for (int m = 0; m < M; ++m) {
-                    float a = static_cast<float>(s_A[m * k_slice_len + k]);
-                    group_acc[m] += a * weight_val;
+                #pragma unroll
+                for (int m = 0; m < MAX_M; ++m) {
+                    if (MAX_M == 1 || m < M) {
+                        float a = static_cast<float>(s_A[m * k_slice_len + k]);
+                        group_acc[m] += a * weight_val;
+                    }
                 }
             }
         }
 
-        for (int m = 0; m < M; ++m) {
-            slice_acc[m] += group_acc[m] * scale;
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (MAX_M == 1 || m < M) {
+                slice_acc[m] += group_acc[m] * scale;
+            }
         }
     }
 
-    for (int m = 0; m < M; ++m) {
-        atomicAdd(&C[m * N + col], static_cast<scalar_t>(slice_acc[m]));
+    if (split_k == 1) {
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (MAX_M == 1 || m < M) {
+                C[m * N + col] = static_cast<scalar_t>(slice_acc[m]);
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (MAX_M == 1 || m < M) {
+                atomicAdd(&C[m * N + col], static_cast<scalar_t>(slice_acc[m]));
+            }
+        }
     }
 }
 
@@ -156,9 +175,8 @@ __global__ void marlin_w4a16_coalesced_kernel(
 
 // Token-Union Coalesced Multi-Token MoE Gate+Up Kernel.
 // Deduplicates identical expert IDs across all M * top_k routed slots on-the-fly in shared memory.
-// Fetches each unique expert's W4A16 weights from HBM strictly ONCE and applies them to all
-// matching tokens simultaneously in registers.
-template <typename scalar_t, int MAX_MATCH = 8, int MAX_SLOTS = 128>
+// Compile-time unrolled over MAX_MATCH so accumulators remain strictly in registers.
+template <typename scalar_t, int MAX_MATCH, int MAX_SLOTS = 128>
 __global__ void fused_moe_token_union_gate_up_kernel(
     const scalar_t* __restrict__ A,               // [M, K]
     const int32_t* __restrict__ B_all_packed,     // [num_experts, K / 8, 2 * I]
@@ -182,41 +200,54 @@ __global__ void fused_moe_token_union_gate_up_kernel(
     __shared__ int s_match_slot[MAX_MATCH];
 
     if (threadIdx.x == 0) {
-        int unique_seen = 0;
-        int target_expert = -1;
-        int limit = min(total_slots, MAX_SLOTS);
-
-        for (int s = 0; s < limit; ++s) {
-            int e = expert_indices[s];
-            if (e < 0 || e >= num_experts) continue;
-            bool already = false;
-            for (int p = 0; p < s; ++p) {
-                if (expert_indices[p] == e) {
-                    already = true;
-                    break;
-                }
+        if (MAX_MATCH == 1) {
+            int e = (u_idx < total_slots) ? expert_indices[u_idx] : -1;
+            if (e >= 0 && e < num_experts) {
+                s_expert_id = e;
+                s_match_count = 1;
+                s_match_tok[0] = u_idx / top_k;
+                s_match_slot[0] = u_idx;
+            } else {
+                s_expert_id = -1;
+                s_match_count = 0;
             }
-            if (!already) {
-                if (unique_seen == u_idx) {
-                    target_expert = e;
-                    break;
-                }
-                unique_seen++;
-            }
-        }
+        } else {
+            int unique_seen = 0;
+            int target_expert = -1;
+            int limit = min(total_slots, MAX_SLOTS);
 
-        s_expert_id = target_expert;
-        int m_cnt = 0;
-        if (target_expert >= 0) {
             for (int s = 0; s < limit; ++s) {
-                if (expert_indices[s] == target_expert && m_cnt < MAX_MATCH) {
-                    s_match_tok[m_cnt] = s / top_k;
-                    s_match_slot[m_cnt] = s;
-                    m_cnt++;
+                int e = expert_indices[s];
+                if (e < 0 || e >= num_experts) continue;
+                bool already = false;
+                for (int p = 0; p < s; ++p) {
+                    if (expert_indices[p] == e) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) {
+                    if (unique_seen == u_idx) {
+                        target_expert = e;
+                        break;
+                    }
+                    unique_seen++;
                 }
             }
+
+            s_expert_id = target_expert;
+            int m_cnt = 0;
+            if (target_expert >= 0) {
+                for (int s = 0; s < limit; ++s) {
+                    if (expert_indices[s] == target_expert && m_cnt < MAX_MATCH) {
+                        s_match_tok[m_cnt] = s / top_k;
+                        s_match_slot[m_cnt] = s;
+                        m_cnt++;
+                    }
+                }
+            }
+            s_match_count = m_cnt;
         }
-        s_match_count = m_cnt;
     }
     __syncthreads();
 
@@ -281,30 +312,39 @@ __global__ void fused_moe_token_union_gate_up_kernel(
                 float w_gate = static_cast<float>(((packed_gate >> (i * 4)) & 0x0F) - 8);
                 float w_up = static_cast<float>(((packed_up >> (i * 4)) & 0x0F) - 8);
 
-                for (int m = 0; m < match_count; ++m) {
-                    float a = static_cast<float>(s_A[m * K + k_idx]);
-                    group_gate[m] += a * w_gate;
-                    group_up[m] += a * w_up;
+                #pragma unroll
+                for (int m = 0; m < MAX_MATCH; ++m) {
+                    if (MAX_MATCH == 1 || m < match_count) {
+                        float a = static_cast<float>(s_A[m * K + k_idx]);
+                        group_gate[m] += a * w_gate;
+                        group_up[m] += a * w_up;
+                    }
                 }
             }
         }
 
-        for (int m = 0; m < match_count; ++m) {
-            acc_gate[m] += group_gate[m] * scale_gate;
-            acc_up[m] += group_up[m] * scale_up;
+        #pragma unroll
+        for (int m = 0; m < MAX_MATCH; ++m) {
+            if (MAX_MATCH == 1 || m < match_count) {
+                acc_gate[m] += group_gate[m] * scale_gate;
+                acc_up[m] += group_up[m] * scale_up;
+            }
         }
     }
 
-    for (int m = 0; m < match_count; ++m) {
-        float act = gelu_tanh(acc_gate[m]) * acc_up[m];
-        int slot_idx = s_match_slot[m];
-        out_acts[slot_idx * I + col] = static_cast<scalar_t>(act);
+    #pragma unroll
+    for (int m = 0; m < MAX_MATCH; ++m) {
+        if (MAX_MATCH == 1 || m < match_count) {
+            float act = gelu_tanh(acc_gate[m]) * acc_up[m];
+            int slot_idx = s_match_slot[m];
+            out_acts[slot_idx * I + col] = static_cast<scalar_t>(act);
+        }
     }
 }
 
 // Token-Union Coalesced Multi-Token MoE Down+Accumulate Kernel.
 // Reads each unique expert's down_proj weights from HBM strictly ONCE across all matching draft tokens.
-template <typename scalar_t, int MAX_MATCH = 8, int MAX_SLOTS = 128>
+template <typename scalar_t, int MAX_MATCH, int MAX_SLOTS = 128>
 __global__ void fused_moe_token_union_down_accum_kernel(
     const scalar_t* __restrict__ out_acts,        // [M * top_k, I]
     const int32_t* __restrict__ down_all_packed,  // [num_experts, I / 8, K]
@@ -330,42 +370,56 @@ __global__ void fused_moe_token_union_down_accum_kernel(
     __shared__ float s_match_weight[MAX_MATCH];
 
     if (threadIdx.x == 0) {
-        int unique_seen = 0;
-        int target_expert = -1;
-        int limit = min(total_slots, MAX_SLOTS);
-
-        for (int s = 0; s < limit; ++s) {
-            int e = expert_indices[s];
-            if (e < 0 || e >= num_experts) continue;
-            bool already = false;
-            for (int p = 0; p < s; ++p) {
-                if (expert_indices[p] == e) {
-                    already = true;
-                    break;
-                }
+        if (MAX_MATCH == 1) {
+            int e = (u_idx < total_slots) ? expert_indices[u_idx] : -1;
+            if (e >= 0 && e < num_experts) {
+                s_expert_id = e;
+                s_match_count = 1;
+                s_match_tok[0] = u_idx / top_k;
+                s_match_slot[0] = u_idx;
+                s_match_weight[0] = static_cast<float>(expert_weights[u_idx]);
+            } else {
+                s_expert_id = -1;
+                s_match_count = 0;
             }
-            if (!already) {
-                if (unique_seen == u_idx) {
-                    target_expert = e;
-                    break;
-                }
-                unique_seen++;
-            }
-        }
+        } else {
+            int unique_seen = 0;
+            int target_expert = -1;
+            int limit = min(total_slots, MAX_SLOTS);
 
-        s_expert_id = target_expert;
-        int m_cnt = 0;
-        if (target_expert >= 0) {
             for (int s = 0; s < limit; ++s) {
-                if (expert_indices[s] == target_expert && m_cnt < MAX_MATCH) {
-                    s_match_tok[m_cnt] = s / top_k;
-                    s_match_slot[m_cnt] = s;
-                    s_match_weight[m_cnt] = static_cast<float>(expert_weights[s]);
-                    m_cnt++;
+                int e = expert_indices[s];
+                if (e < 0 || e >= num_experts) continue;
+                bool already = false;
+                for (int p = 0; p < s; ++p) {
+                    if (expert_indices[p] == e) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) {
+                    if (unique_seen == u_idx) {
+                        target_expert = e;
+                        break;
+                    }
+                    unique_seen++;
                 }
             }
+
+            s_expert_id = target_expert;
+            int m_cnt = 0;
+            if (target_expert >= 0) {
+                for (int s = 0; s < limit; ++s) {
+                    if (expert_indices[s] == target_expert && m_cnt < MAX_MATCH) {
+                        s_match_tok[m_cnt] = s / top_k;
+                        s_match_slot[m_cnt] = s;
+                        s_match_weight[m_cnt] = static_cast<float>(expert_weights[s]);
+                        m_cnt++;
+                    }
+                }
+            }
+            s_match_count = m_cnt;
         }
-        s_match_count = m_cnt;
     }
     __syncthreads();
 
@@ -422,23 +476,56 @@ __global__ void fused_moe_token_union_down_accum_kernel(
                 int i_idx = local_i + i;
                 float w_val = static_cast<float>(((packed_val >> (i * 4)) & 0x0F) - 8);
 
-                for (int m = 0; m < match_count; ++m) {
-                    float a = static_cast<float>(s_act[m * I + i_idx]);
-                    group_acc[m] += a * w_val;
+                #pragma unroll
+                for (int m = 0; m < MAX_MATCH; ++m) {
+                    if (MAX_MATCH == 1 || m < match_count) {
+                        float a = static_cast<float>(s_act[m * I + i_idx]);
+                        group_acc[m] += a * w_val;
+                    }
                 }
             }
         }
 
-        for (int m = 0; m < match_count; ++m) {
-            expert_acc[m] += group_acc[m] * scale;
+        #pragma unroll
+        for (int m = 0; m < MAX_MATCH; ++m) {
+            if (MAX_MATCH == 1 || m < match_count) {
+                expert_acc[m] += group_acc[m] * scale;
+            }
         }
     }
 
-    for (int m = 0; m < match_count; ++m) {
-        int tok_idx = s_match_tok[m];
-        float weight = s_match_weight[m];
-        atomicAdd(&out[tok_idx * K + col], static_cast<scalar_t>(expert_acc[m] * weight));
+    #pragma unroll
+    for (int m = 0; m < MAX_MATCH; ++m) {
+        if (MAX_MATCH == 1 || m < match_count) {
+            int tok_idx = s_match_tok[m];
+            float weight = s_match_weight[m];
+            atomicAdd(&out[tok_idx * K + col], static_cast<scalar_t>(expert_acc[m] * weight));
+        }
     }
+}
+
+template <typename scalar_t, int MAX_MATCH>
+void dispatch_moe_kernels(
+    const scalar_t* x_ptr,
+    const int32_t* gu_packed_ptr,
+    const scalar_t* gu_scales_ptr,
+    const int32_t* down_packed_ptr,
+    const scalar_t* down_scales_ptr,
+    const int32_t* indices_ptr,
+    const scalar_t* weights_ptr,
+    scalar_t* out_acts_ptr,
+    scalar_t* out_ptr,
+    int M, int K, int I, int group_size, int num_experts, int top_k,
+    dim3 grid_gu, dim3 grid_down, int threads, size_t smem_gu, size_t smem_down
+) {
+    fused_moe_token_union_gate_up_kernel<scalar_t, MAX_MATCH><<<grid_gu, threads, smem_gu>>>(
+        x_ptr, gu_packed_ptr, gu_scales_ptr, indices_ptr, out_acts_ptr,
+        M, K, I, group_size, num_experts, top_k
+    );
+    fused_moe_token_union_down_accum_kernel<scalar_t, MAX_MATCH><<<grid_down, threads, smem_down>>>(
+        out_acts_ptr, down_packed_ptr, down_scales_ptr, indices_ptr, weights_ptr, out_ptr,
+        M, I, K, group_size, num_experts, top_k
+    );
 }
 
 void launch_fused_batched_moe(
@@ -473,68 +560,63 @@ void launch_fused_batched_moe(
     dim3 grid_gu((I + threads - 1) / threads, total_slots);
     dim3 grid_down((K + threads - 1) / threads, total_slots);
 
-    int max_match = min(M, 8);
+    int max_match = (M == 1) ? 1 : ((M <= 4) ? 4 : 8);
     size_t smem_gu = max_match * K * x.element_size();
     size_t smem_down = max_match * I * x.element_size();
 
+    #define LAUNCH_MOE_FOR_TYPE(SCALAR_T, PTR_T) \
+        if (max_match == 1) { \
+            dispatch_moe_kernels<SCALAR_T, 1>( \
+                reinterpret_cast<const SCALAR_T*>(x.data_ptr<PTR_T>()), \
+                gate_up_packed.data_ptr<int32_t>(), \
+                reinterpret_cast<const SCALAR_T*>(gate_up_scales.data_ptr<PTR_T>()), \
+                down_packed.data_ptr<int32_t>(), \
+                reinterpret_cast<const SCALAR_T*>(down_scales.data_ptr<PTR_T>()), \
+                indices_i32.data_ptr<int32_t>(), \
+                reinterpret_cast<const SCALAR_T*>(weights_cast.data_ptr<PTR_T>()), \
+                reinterpret_cast<SCALAR_T*>(out_acts.data_ptr<PTR_T>()), \
+                reinterpret_cast<SCALAR_T*>(out.data_ptr<PTR_T>()), \
+                M, K, I, group_size, num_experts, top_k, \
+                grid_gu, grid_down, threads, smem_gu, smem_down \
+            ); \
+        } else if (max_match == 4) { \
+            dispatch_moe_kernels<SCALAR_T, 4>( \
+                reinterpret_cast<const SCALAR_T*>(x.data_ptr<PTR_T>()), \
+                gate_up_packed.data_ptr<int32_t>(), \
+                reinterpret_cast<const SCALAR_T*>(gate_up_scales.data_ptr<PTR_T>()), \
+                down_packed.data_ptr<int32_t>(), \
+                reinterpret_cast<const SCALAR_T*>(down_scales.data_ptr<PTR_T>()), \
+                indices_i32.data_ptr<int32_t>(), \
+                reinterpret_cast<const SCALAR_T*>(weights_cast.data_ptr<PTR_T>()), \
+                reinterpret_cast<SCALAR_T*>(out_acts.data_ptr<PTR_T>()), \
+                reinterpret_cast<SCALAR_T*>(out.data_ptr<PTR_T>()), \
+                M, K, I, group_size, num_experts, top_k, \
+                grid_gu, grid_down, threads, smem_gu, smem_down \
+            ); \
+        } else { \
+            dispatch_moe_kernels<SCALAR_T, 8>( \
+                reinterpret_cast<const SCALAR_T*>(x.data_ptr<PTR_T>()), \
+                gate_up_packed.data_ptr<int32_t>(), \
+                reinterpret_cast<const SCALAR_T*>(gate_up_scales.data_ptr<PTR_T>()), \
+                down_packed.data_ptr<int32_t>(), \
+                reinterpret_cast<const SCALAR_T*>(down_scales.data_ptr<PTR_T>()), \
+                indices_i32.data_ptr<int32_t>(), \
+                reinterpret_cast<const SCALAR_T*>(weights_cast.data_ptr<PTR_T>()), \
+                reinterpret_cast<SCALAR_T*>(out_acts.data_ptr<PTR_T>()), \
+                reinterpret_cast<SCALAR_T*>(out.data_ptr<PTR_T>()), \
+                M, K, I, group_size, num_experts, top_k, \
+                grid_gu, grid_down, threads, smem_gu, smem_down \
+            ); \
+        }
+
     if (x.scalar_type() == torch::kBFloat16) {
-        fused_moe_token_union_gate_up_kernel<__nv_bfloat16><<<grid_gu, threads, smem_gu>>>(
-            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
-            gate_up_packed.data_ptr<int32_t>(),
-            reinterpret_cast<const __nv_bfloat16*>(gate_up_scales.data_ptr<at::BFloat16>()),
-            indices_i32.data_ptr<int32_t>(),
-            reinterpret_cast<__nv_bfloat16*>(out_acts.data_ptr<at::BFloat16>()),
-            M, K, I, group_size, num_experts, top_k
-        );
-
-        fused_moe_token_union_down_accum_kernel<__nv_bfloat16><<<grid_down, threads, smem_down>>>(
-            reinterpret_cast<const __nv_bfloat16*>(out_acts.data_ptr<at::BFloat16>()),
-            down_packed.data_ptr<int32_t>(),
-            reinterpret_cast<const __nv_bfloat16*>(down_scales.data_ptr<at::BFloat16>()),
-            indices_i32.data_ptr<int32_t>(),
-            reinterpret_cast<const __nv_bfloat16*>(weights_cast.data_ptr<at::BFloat16>()),
-            reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-            M, I, K, group_size, num_experts, top_k
-        );
+        LAUNCH_MOE_FOR_TYPE(__nv_bfloat16, at::BFloat16);
     } else if (x.scalar_type() == torch::kFloat16) {
-        fused_moe_token_union_gate_up_kernel<half><<<grid_gu, threads, smem_gu>>>(
-            reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
-            gate_up_packed.data_ptr<int32_t>(),
-            reinterpret_cast<const half*>(gate_up_scales.data_ptr<at::Half>()),
-            indices_i32.data_ptr<int32_t>(),
-            reinterpret_cast<half*>(out_acts.data_ptr<at::Half>()),
-            M, K, I, group_size, num_experts, top_k
-        );
-
-        fused_moe_token_union_down_accum_kernel<half><<<grid_down, threads, smem_down>>>(
-            reinterpret_cast<const half*>(out_acts.data_ptr<at::Half>()),
-            down_packed.data_ptr<int32_t>(),
-            reinterpret_cast<const half*>(down_scales.data_ptr<at::Half>()),
-            indices_i32.data_ptr<int32_t>(),
-            reinterpret_cast<const half*>(weights_cast.data_ptr<at::Half>()),
-            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-            M, I, K, group_size, num_experts, top_k
-        );
+        LAUNCH_MOE_FOR_TYPE(half, at::Half);
     } else {
-        fused_moe_token_union_gate_up_kernel<float><<<grid_gu, threads, smem_gu>>>(
-            x.data_ptr<float>(),
-            gate_up_packed.data_ptr<int32_t>(),
-            gate_up_scales.data_ptr<float>(),
-            indices_i32.data_ptr<int32_t>(),
-            out_acts.data_ptr<float>(),
-            M, K, I, group_size, num_experts, top_k
-        );
-
-        fused_moe_token_union_down_accum_kernel<float><<<grid_down, threads, smem_down>>>(
-            out_acts.data_ptr<float>(),
-            down_packed.data_ptr<int32_t>(),
-            down_scales.data_ptr<float>(),
-            indices_i32.data_ptr<int32_t>(),
-            weights_cast.data_ptr<float>(),
-            out.data_ptr<float>(),
-            M, I, K, group_size, num_experts, top_k
-        );
+        LAUNCH_MOE_FOR_TYPE(float, float);
     }
+    #undef LAUNCH_MOE_FOR_TYPE
 }
 
 void launch_marlin_w4a16(
@@ -552,40 +634,62 @@ void launch_marlin_w4a16(
     int blocks_x = (N + threads_x - 1) / threads_x;
 
     if (M <= 8) {
-        int split_k = 8;
+        // When N >= 16384 (e.g. lm_head with N=262144), blocks_x >= 128 already saturates all SMs;
+        // using split_k = 1 avoids C.zero_() and millions of global memory atomicAdd operations.
+        int split_k = (N >= 16384) ? 1 : 8;
         dim3 grid(blocks_x, split_k);
         dim3 block(threads_x, 1);
-        C.zero_();
+        if (split_k > 1) {
+            C.zero_();
+        }
         int num_groups = K / group_size;
         int groups_per_slice = (num_groups + split_k - 1) / split_k;
         int k_slice_len = groups_per_slice * group_size;
         size_t smem_splitk = M * k_slice_len * A.element_size();
 
+        #define LAUNCH_SPLITK_FOR_TYPE(SCALAR_T, PTR_T) \
+            if (M == 1) { \
+                marlin_w4a16_splitk_batched_kernel<SCALAR_T, 1><<<grid, block, smem_splitk>>>( \
+                    reinterpret_cast<const SCALAR_T*>(A.data_ptr<PTR_T>()), \
+                    B_packed.data_ptr<int32_t>(), \
+                    reinterpret_cast<const SCALAR_T*>(scales.data_ptr<PTR_T>()), \
+                    reinterpret_cast<SCALAR_T*>(C.data_ptr<PTR_T>()), \
+                    M, K, N, group_size, split_k \
+                ); \
+            } else if (M == 2) { \
+                marlin_w4a16_splitk_batched_kernel<SCALAR_T, 2><<<grid, block, smem_splitk>>>( \
+                    reinterpret_cast<const SCALAR_T*>(A.data_ptr<PTR_T>()), \
+                    B_packed.data_ptr<int32_t>(), \
+                    reinterpret_cast<const SCALAR_T*>(scales.data_ptr<PTR_T>()), \
+                    reinterpret_cast<SCALAR_T*>(C.data_ptr<PTR_T>()), \
+                    M, K, N, group_size, split_k \
+                ); \
+            } else if (M <= 4) { \
+                marlin_w4a16_splitk_batched_kernel<SCALAR_T, 4><<<grid, block, smem_splitk>>>( \
+                    reinterpret_cast<const SCALAR_T*>(A.data_ptr<PTR_T>()), \
+                    B_packed.data_ptr<int32_t>(), \
+                    reinterpret_cast<const SCALAR_T*>(scales.data_ptr<PTR_T>()), \
+                    reinterpret_cast<SCALAR_T*>(C.data_ptr<PTR_T>()), \
+                    M, K, N, group_size, split_k \
+                ); \
+            } else { \
+                marlin_w4a16_splitk_batched_kernel<SCALAR_T, 8><<<grid, block, smem_splitk>>>( \
+                    reinterpret_cast<const SCALAR_T*>(A.data_ptr<PTR_T>()), \
+                    B_packed.data_ptr<int32_t>(), \
+                    reinterpret_cast<const SCALAR_T*>(scales.data_ptr<PTR_T>()), \
+                    reinterpret_cast<SCALAR_T*>(C.data_ptr<PTR_T>()), \
+                    M, K, N, group_size, split_k \
+                ); \
+            }
+
         if (A.scalar_type() == torch::kBFloat16) {
-            marlin_w4a16_splitk_batched_kernel<__nv_bfloat16><<<grid, block, smem_splitk>>>(
-                reinterpret_cast<const __nv_bfloat16*>(A.data_ptr<at::BFloat16>()),
-                B_packed.data_ptr<int32_t>(),
-                reinterpret_cast<const __nv_bfloat16*>(scales.data_ptr<at::BFloat16>()),
-                reinterpret_cast<__nv_bfloat16*>(C.data_ptr<at::BFloat16>()),
-                M, K, N, group_size, split_k
-            );
+            LAUNCH_SPLITK_FOR_TYPE(__nv_bfloat16, at::BFloat16);
         } else if (A.scalar_type() == torch::kFloat16) {
-            marlin_w4a16_splitk_batched_kernel<half><<<grid, block, smem_splitk>>>(
-                reinterpret_cast<const half*>(A.data_ptr<at::Half>()),
-                B_packed.data_ptr<int32_t>(),
-                reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
-                reinterpret_cast<half*>(C.data_ptr<at::Half>()),
-                M, K, N, group_size, split_k
-            );
+            LAUNCH_SPLITK_FOR_TYPE(half, at::Half);
         } else {
-            marlin_w4a16_splitk_batched_kernel<float><<<grid, block, smem_splitk>>>(
-                A.data_ptr<float>(),
-                B_packed.data_ptr<int32_t>(),
-                scales.data_ptr<float>(),
-                C.data_ptr<float>(),
-                M, K, N, group_size, split_k
-            );
+            LAUNCH_SPLITK_FOR_TYPE(float, float);
         }
+        #undef LAUNCH_SPLITK_FOR_TYPE
         return;
     }
 

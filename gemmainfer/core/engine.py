@@ -145,13 +145,22 @@ class GemmaInferEngine:
             return
 
         # Precompute last sliding_attention and full_attention layer indices for cross-model KV sharing
-        sliding_idx = len(past_kv) - 1
-        full_idx = len(past_kv) - 1
+        sliding_idx = -1
+        full_idx = -1
         for i in range(len(past_kv) - 1, -1, -1):
-            if self.config.is_full_attention(i) and full_idx == len(past_kv) - 1:
+            if self.config.is_full_attention(i) and full_idx == -1:
                 full_idx = i
-            elif not self.config.is_full_attention(i) and sliding_idx == len(past_kv) - 1:
+            elif not self.config.is_full_attention(i) and sliding_idx == -1:
                 sliding_idx = i
+            if sliding_idx != -1 and full_idx != -1:
+                break
+        if sliding_idx == -1:
+            sliding_idx = len(past_kv) - 1
+        if full_idx == -1:
+            full_idx = len(past_kv) - 1
+
+        base_draft_len = self.dspark.max_draft_len if self.dspark is not None else 4
+        cur_draft_len = base_draft_len
 
         while not seq.is_finished:
             tokens_so_far = seq.prompt_token_ids + seq.output_token_ids
@@ -161,6 +170,7 @@ class GemmaInferEngine:
             draft_cont: List[int] = []
             if self.dspark is not None:
                 if self.dspark.assistant_drafter is not None:
+                    self.dspark.assistant_drafter.max_draft_len = cur_draft_len
                     s_kv = past_kv[sliding_idx]
                     f_kv = past_kv[full_idx]
                     s_len = s_kv[2][1] if len(s_kv[2]) > 1 else s_kv[2][0]
@@ -184,28 +194,51 @@ class GemmaInferEngine:
             verify_tensor = torch.tensor([verify_list], dtype=torch.long, device=self.device)
             num_verify = len(verify_list)
 
-            all_logits, past_kv, all_hidden = self.model(
-                verify_tensor,
-                past_key_values=past_kv,
-                return_logits_only_last=(num_verify == 1),
-                return_hidden_states=True,
-            )
+            need_hidden = self.dspark is not None and self.dspark.assistant_drafter is not None
+            if need_hidden:
+                all_logits, past_kv, all_hidden = self.model(
+                    verify_tensor,
+                    past_key_values=past_kv,
+                    return_logits_only_last=(num_verify == 1),
+                    return_hidden_states=True,
+                )
+            else:
+                all_logits, past_kv = self.model(
+                    verify_tensor,
+                    past_key_values=past_kv,
+                    return_logits_only_last=(num_verify == 1),
+                    return_hidden_states=False,
+                )
+                all_hidden = None
 
             # Verify draft_cont against target logits at positions [0 .. num_verify-1]
             n_matches = 1  # verify_list[0] == bonus_tok is already guaranteed valid
             newly_accepted: List[int] = []
 
-            for i in range(len(draft_cont)):
-                pred_i = _sample_token(all_logits[0, i, :], temperature=temperature, top_p=top_p)
-                if pred_i == draft_cont[i]:
-                    newly_accepted.append(draft_cont[i])
-                    n_matches += 1
+            if temperature <= 1e-5:
+                preds = torch.argmax(all_logits[0], dim=-1).tolist()
+                for i in range(len(draft_cont)):
+                    pred_i = preds[i]
+                    if pred_i == draft_cont[i]:
+                        newly_accepted.append(draft_cont[i])
+                        n_matches += 1
+                    else:
+                        newly_accepted.append(pred_i)
+                        break
                 else:
-                    newly_accepted.append(pred_i)
-                    break
+                    newly_accepted.append(preds[num_verify - 1])
             else:
-                next_bonus = _sample_token(all_logits[0, num_verify - 1, :], temperature=temperature, top_p=top_p)
-                newly_accepted.append(next_bonus)
+                for i in range(len(draft_cont)):
+                    pred_i = _sample_token(all_logits[0, i, :], temperature=temperature, top_p=top_p)
+                    if pred_i == draft_cont[i]:
+                        newly_accepted.append(draft_cont[i])
+                        n_matches += 1
+                    else:
+                        newly_accepted.append(pred_i)
+                        break
+                else:
+                    next_bonus = _sample_token(all_logits[0, num_verify - 1, :], temperature=temperature, top_p=top_p)
+                    newly_accepted.append(next_bonus)
 
             # Roll back rejected speculative slots in KV cache metadata (zero-copy rollback)
             dropped = num_verify - n_matches
@@ -229,8 +262,15 @@ class GemmaInferEngine:
                 if tok in eos_tokens or seq.is_finished:
                     return
 
+            # Adaptive draft horizon: expand to 6 on full-match streaks, reset to base_draft_len on rejection
+            if num_verify > 1 and n_matches == num_verify:
+                cur_draft_len = min(6, cur_draft_len + 2)
+            else:
+                cur_draft_len = base_draft_len
+
             # Synchronize state for the next cycle directly from the verification pass (ZERO extra forward passes!)
-            last_h = all_hidden[:, n_matches - 1 : n_matches, :]
+            if all_hidden is not None:
+                last_h = all_hidden[:, n_matches - 1 : n_matches, :]
             bonus_tok = newly_accepted[-1]
 
     @torch.inference_mode()

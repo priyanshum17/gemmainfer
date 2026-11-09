@@ -7,6 +7,8 @@ try:
 except ImportError:
     _HAS_CSRC = False
 
+_EMPTY_WEIGHT = torch.empty(0)
+
 
 class GemmaRMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (RMSNorm) with optional unit offset and CUDA acceleration."""
@@ -27,13 +29,20 @@ class GemmaRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply RMS normalization to tensor x."""
+        if _HAS_CSRC and x.is_contiguous():
+            if not self.with_scale or self.weight is None:
+                if x.is_cuda:
+                    out = torch.empty_like(x)
+                    gemmainfer_csrc.rmsnorm(x, _EMPTY_WEIGHT, out, self.eps, False)
+                    return out
+                return self._norm(x.float()).type_as(x)
+            if self.weight.is_contiguous():
+                out = torch.empty_like(x)
+                gemmainfer_csrc.rmsnorm(x, self.weight, out, self.eps, self.add_unit_offset)
+                return out
+
         if not self.with_scale or self.weight is None:
             return self._norm(x.float()).type_as(x)
-
-        if _HAS_CSRC and x.is_contiguous() and self.weight.is_contiguous():
-            out = torch.empty_like(x)
-            gemmainfer_csrc.rmsnorm(x, self.weight, out, self.eps, self.add_unit_offset)
-            return out
 
         normed = self._norm(x.float()).type_as(x)
         if self.add_unit_offset:
